@@ -17,6 +17,15 @@ defmodule FakeS3.Router do
     send_resp(conn, 200, "ok")
   end
 
+  get "/__debug/objects" do
+    objects = Storage.debug_list_all_objects()
+    json = Jason.encode!(objects, pretty: true)
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, json)
+  end
+
   get "/" do
     buckets = Storage.list_buckets()
     xml = S3XML.list_buckets(buckets, request_id(conn))
@@ -71,14 +80,21 @@ defmodule FakeS3.Router do
   put "/:bucket/*key" do
     with :ok <- validate_bucket(bucket),
          true <- Storage.bucket_exists?(bucket),
-         {:ok, key} <- normalize_key(key),
-         :ok <- enforce_body_limit(conn) do
-      handle_put_object(conn, bucket, key)
+         {:ok, key} <- normalize_key(key) do
+      case get_copy_source(conn) do
+        {:ok, {src_bucket, src_key}} ->
+          handle_copy_object(conn, src_bucket, src_key, bucket, key)
+
+        nil ->
+          case enforce_body_limit(conn) do
+            :ok -> handle_put_object(conn, bucket, key)
+            {:error, :entity_too_large} -> send_resp(conn, 413, "Request entity too large")
+          end
+      end
     else
       {:error, :invalid_bucket} -> error_xml(conn, 400, "InvalidBucketName", "The specified bucket is not valid.", "/#{bucket}")
       false -> error_xml(conn, 404, "NoSuchBucket", "The specified bucket does not exist.", "/#{bucket}")
       {:error, :invalid_key} -> error_xml(conn, 400, "InvalidArgument", "The specified key is not valid.", "/#{bucket}")
-      {:error, :entity_too_large} -> send_resp(conn, 413, "Request entity too large")
       {:error, reason} -> send_resp(conn, 500, inspect(reason))
     end
   end
@@ -159,6 +175,37 @@ defmodule FakeS3.Router do
 
       {:error, :not_found} ->
         error_xml(conn, 404, "NoSuchKey", "The specified key does not exist.", "/#{bucket}/#{key}")
+    end
+  end
+
+  defp handle_copy_object(conn, src_bucket, src_key, dest_bucket, dest_key) do
+    case Storage.copy_object(src_bucket, src_key, dest_bucket, dest_key) do
+      {:ok, %{etag: etag, last_modified: last_modified}} ->
+        xml = S3XML.copy_object_result(etag, last_modified)
+        xml_resp(conn, 200, xml)
+
+      {:error, :source_not_found} ->
+        error_xml(conn, 404, "NoSuchKey", "The specified key does not exist.", "/#{src_bucket}/#{src_key}")
+
+      {:error, reason} ->
+        send_resp(conn, 500, inspect(reason))
+    end
+  end
+
+  defp get_copy_source(conn) do
+    case Plug.Conn.get_req_header(conn, "x-amz-copy-source") do
+      [source | _] ->
+        source = URI.decode(source)
+        # Handle both "/bucket/key" and "bucket/key" formats
+        source = String.trim_leading(source, "/")
+
+        case String.split(source, "/", parts: 2) do
+          [bucket, key] when key != "" -> {:ok, {bucket, key}}
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -276,9 +323,10 @@ defmodule FakeS3.Router do
 
   defp stream_to_file(conn, io) do
     hash_ctx = :crypto.hash_init(:md5)
-    read_opts = [length: Config.max_body_bytes() || :infinity, read_length: 1_048_576, timeout: 30_000]
+    max_bytes = Config.max_body_bytes()
+    read_opts = [read_length: 1_048_576, timeout: 30_000]
 
-    case read_body_chunks(conn, io, hash_ctx, 0, read_opts) do
+    case read_body_chunks(conn, io, hash_ctx, 0, max_bytes, read_opts) do
       {:ok, ctx, size} ->
         md5 = :crypto.hash_final(ctx)
         etag = "\"" <> Base.encode16(md5, case: :lower) <> "\""
@@ -289,17 +337,29 @@ defmodule FakeS3.Router do
     end
   end
 
-  defp read_body_chunks(conn, io, ctx, size, read_opts) do
+  defp read_body_chunks(conn, io, ctx, size, max_bytes, read_opts) do
     case Plug.Conn.read_body(conn, read_opts) do
       {:ok, data, _conn} ->
-        :ok = IO.binwrite(io, data)
-        ctx = :crypto.hash_update(ctx, data)
-        {:ok, ctx, size + byte_size(data)}
+        new_size = size + byte_size(data)
+
+        if max_bytes != nil and new_size > max_bytes do
+          {:error, :entity_too_large}
+        else
+          :ok = IO.binwrite(io, data)
+          ctx = :crypto.hash_update(ctx, data)
+          {:ok, ctx, new_size}
+        end
 
       {:more, data, conn} ->
-        :ok = IO.binwrite(io, data)
-        ctx = :crypto.hash_update(ctx, data)
-        read_body_chunks(conn, io, ctx, size + byte_size(data), read_opts)
+        new_size = size + byte_size(data)
+
+        if max_bytes != nil and new_size > max_bytes do
+          {:error, :entity_too_large}
+        else
+          :ok = IO.binwrite(io, data)
+          ctx = :crypto.hash_update(ctx, data)
+          read_body_chunks(conn, io, ctx, new_size, max_bytes, read_opts)
+        end
 
       {:error, reason} ->
         {:error, reason}

@@ -59,6 +59,14 @@ defmodule FakeS3.S3XML do
     |> generate()
   end
 
+  def copy_object_result(etag, last_modified) do
+    document(:CopyObjectResult, %{xmlns: "http://s3.amazonaws.com/doc/2006-03-01/"}, [
+      element(:ETag, etag),
+      element(:LastModified, last_modified)
+    ])
+    |> generate()
+  end
+
   defp bucket_xml(bucket) do
     element(:Bucket, [
       element(:Name, bucket.name),

@@ -165,6 +165,38 @@ defmodule FakeS3.Storage do
     :ok
   end
 
+  def copy_object(src_bucket, src_key, dest_bucket, dest_key) do
+    case read_object(src_bucket, src_key) do
+      {:ok, %{content_path: src_content_path, meta: src_meta}} ->
+        dest_content_path = object_path(dest_bucket, dest_key)
+        dest_meta_path = object_meta_path(dest_bucket, dest_key)
+
+        File.mkdir_p(Path.dirname(dest_content_path))
+        File.mkdir_p(Path.dirname(dest_meta_path))
+
+        case File.copy(src_content_path, dest_content_path) do
+          {:ok, _} ->
+            last_modified = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+            new_meta = %{
+              src_meta
+              | "key" => dest_key,
+                "bucket" => dest_bucket,
+                "last_modified" => last_modified
+            }
+
+            :ok = write_json_atomic(dest_meta_path, new_meta)
+            {:ok, %{etag: src_meta["etag"], last_modified: last_modified}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, :not_found} ->
+        {:error, :source_not_found}
+    end
+  end
+
   def list_keys(bucket) do
     dir = objects_dir(bucket)
 
@@ -232,5 +264,32 @@ defmodule FakeS3.Storage do
       _ ->
         false
     end
+  end
+
+  def debug_list_all_objects do
+    buckets = list_buckets() || []
+
+    Enum.flat_map(buckets, fn bucket_meta ->
+      bucket = bucket_meta.name
+      keys = list_keys(bucket)
+
+      Enum.map(keys, fn key ->
+        case read_object(bucket, key) do
+          {:ok, %{meta: meta, stat: stat}} ->
+            %{
+              bucket: bucket,
+              key: key,
+              size: stat.size,
+              etag: meta["etag"],
+              content_type: meta["content_type"],
+              last_modified: meta["last_modified"],
+              user_metadata: meta["user_metadata"] || %{}
+            }
+
+          _ ->
+            %{bucket: bucket, key: key, error: "metadata_missing"}
+        end
+      end)
+    end)
   end
 end
