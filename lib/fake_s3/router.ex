@@ -13,6 +13,13 @@ defmodule FakeS3.Router do
   plug :match
   plug :dispatch
 
+  def init(opts), do: opts
+
+  def call(conn, opts) do
+    conn = FakeS3.ConfigPlug.call(conn, FakeS3.ConfigPlug.init(opts))
+    super(conn, opts)
+  end
+
   get "/__health" do
     send_resp(conn, 200, "ok")
   end
@@ -85,6 +92,9 @@ defmodule FakeS3.Router do
         {:ok, {src_bucket, src_key}} ->
           handle_copy_object(conn, src_bucket, src_key, bucket, key)
 
+        {:error, :invalid_copy_source} ->
+          error_xml(conn, 400, "InvalidArgument", "The specified copy source is not valid.", "/#{bucket}/#{key}")
+
         nil ->
           case enforce_body_limit(conn) do
             :ok -> handle_put_object(conn, bucket, key)
@@ -149,8 +159,11 @@ defmodule FakeS3.Router do
         |> put_resp_header("etag", etag)
         |> send_resp(200, "")
 
-      {:error, reason} ->
-        send_resp(conn, 500, inspect(reason))
+          {:error, :entity_too_large} ->
+            send_resp(conn, 413, "Request entity too large")
+
+          {:error, reason} ->
+            send_resp(conn, 500, inspect(reason))
     end
   end
 
@@ -193,19 +206,38 @@ defmodule FakeS3.Router do
   end
 
   defp get_copy_source(conn) do
-    case Plug.Conn.get_req_header(conn, "x-amz-copy-source") do
-      [source | _] ->
-        source = URI.decode(source)
-        # Handle both "/bucket/key" and "bucket/key" formats
-        source = String.trim_leading(source, "/")
+    header =
+      conn
+      |> Plug.Conn.get_req_header("x-amz-copy-source")
+      |> List.first()
 
-        case String.split(source, "/", parts: 2) do
-          [bucket, key] when key != "" -> {:ok, {bucket, key}}
-          _ -> nil
-        end
+    source =
+      case header do
+        nil ->
+          conn = fetch_query_params(conn)
+          conn.query_params["copy-source"]
 
-      _ ->
-        nil
+        value ->
+          value
+      end
+
+    if is_binary(source) do
+      source = source |> URI.decode() |> String.trim_leading("/")
+
+      case String.split(source, "/", parts: 2) do
+        [bucket, key] when key != "" ->
+          with :ok <- validate_bucket(bucket),
+               {:ok, safe_key} <- Key.safe_key(key) do
+            {:ok, {bucket, safe_key}}
+          else
+            _ -> {:error, :invalid_copy_source}
+          end
+
+        _ ->
+          {:error, :invalid_copy_source}
+      end
+    else
+      nil
     end
   end
 
@@ -408,10 +440,22 @@ defmodule FakeS3.Router do
 
   defp parse_range("bytes=" <> range, size) do
     case String.split(range, "-", parts: 2) do
+      ["", end_s] ->
+        with {suffix, ""} <- Integer.parse(end_s),
+             true <- suffix > 0 do
+          length = min(suffix, size)
+          start = size - length
+          end_pos = size - 1
+          {:ok, {start, length, end_pos}}
+        else
+          _ -> :error
+        end
+
       [start_s, end_s] ->
         with {start, ""} <- Integer.parse(start_s),
              end_pos <- if(end_s == "", do: size - 1, else: String.to_integer(end_s)),
              true <- start <= end_pos,
+             true <- start < size,
              true <- end_pos < size do
           length = end_pos - start + 1
           {:ok, {start, length, end_pos}}

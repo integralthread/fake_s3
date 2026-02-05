@@ -1,30 +1,8 @@
 defmodule FakeS3.ContractReqS3Test do
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   setup_all do
-    tmp =
-      System.tmp_dir!()
-      |> Path.join("fake_s3_test_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(tmp)
-    File.mkdir_p!(tmp)
-
-    System.put_env("FAKES3_DATA_DIR", tmp)
-    System.put_env("FAKES3_MODE", "noauth")
-
-    ref = :"fake_s3_test_#{System.unique_integer([:positive])}"
-
-    {:ok, _pid} =
-      Plug.Cowboy.http(
-        FakeS3.Router,
-        [],
-        ip: {127, 0, 0, 1},
-        port: 0,
-        ref: ref
-      )
-
-    port = :ranch.get_port(ref)
-    endpoint = "http://127.0.0.1:#{port}"
+    {:ok, endpoint: endpoint, ref: ref, tmp: tmp} = start_server(%{mode: "noauth"})
 
     on_exit(fn ->
       Plug.Cowboy.shutdown(ref)
@@ -87,6 +65,7 @@ defmodule FakeS3.ContractReqS3Test do
     assert resp_delim.body =~ "<CommonPrefixes>"
     assert resp_delim.body =~ "<Prefix>logs/2026/</Prefix>"
     assert resp_delim.body =~ "<IsTruncated>false</IsTruncated>"
+    assert resp_delim.body =~ "<KeyCount>1</KeyCount>"
 
     resp_page1 =
       Req.get!(req,
@@ -131,6 +110,19 @@ defmodule FakeS3.ContractReqS3Test do
     assert %{status: 204} = Req.delete!(req, url: "s3://#{bucket}")
   end
 
+  test "list buckets returns created bucket", %{endpoint: endpoint} do
+    req = s3_req(endpoint)
+    bucket = unique_bucket()
+
+    assert %{status: 200} = Req.put!(req, url: "s3://#{bucket}")
+
+    resp = Req.get!(req, url: "s3://")
+    assert resp.status == 200
+    assert resp.body =~ "<Name>#{bucket}</Name>"
+
+    assert %{status: 204} = Req.delete!(req, url: "s3://#{bucket}")
+  end
+
   defp s3_req(endpoint) do
     Req.new(decode_body: false)
     |> ReqS3.attach(
@@ -155,6 +147,31 @@ defmodule FakeS3.ContractReqS3Test do
       {_, v} when is_binary(v) -> v
       nil -> nil
     end
+  end
+
+  defp start_server(config) do
+    tmp =
+      System.tmp_dir!()
+      |> Path.join("fake_s3_test_#{System.unique_integer([:positive])}")
+
+    File.rm_rf!(tmp)
+    File.mkdir_p!(tmp)
+
+    ref = :"fake_s3_test_#{System.unique_integer([:positive])}"
+
+    {:ok, _pid} =
+      Plug.Cowboy.http(
+        FakeS3.Router,
+        [config: Map.put(config, :data_dir, tmp)],
+        ip: {127, 0, 0, 1},
+        port: 0,
+        ref: ref
+      )
+
+    port = :ranch.get_port(ref)
+    endpoint = "http://127.0.0.1:#{port}"
+
+    {:ok, endpoint: endpoint, ref: ref, tmp: tmp}
   end
 
   test "range requests return partial content", %{endpoint: endpoint} do
@@ -183,6 +200,26 @@ defmodule FakeS3.ContractReqS3Test do
     assert resp.body == "requests!"
 
     # Cleanup
+    Req.delete!(req, url: "s3://#{bucket}/range.txt")
+    Req.delete!(req, url: "s3://#{bucket}")
+  end
+
+  test "range suffix request returns tail bytes", %{endpoint: endpoint} do
+    bucket = unique_bucket()
+    req = s3_req(endpoint)
+
+    assert %{status: 200} = Req.put!(req, url: "s3://#{bucket}")
+    assert %{status: 200} = Req.put!(req, url: "s3://#{bucket}/range.txt", body: "0123456789")
+
+    resp =
+      Req.get!(req,
+        url: "s3://#{bucket}/range.txt",
+        headers: [{"range", "bytes=-4"}]
+      )
+
+    assert resp.status == 206
+    assert resp.body == "6789"
+
     Req.delete!(req, url: "s3://#{bucket}/range.txt")
     Req.delete!(req, url: "s3://#{bucket}")
   end

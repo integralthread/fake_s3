@@ -1,40 +1,18 @@
 defmodule FakeS3.AuthTest do
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   describe "static auth mode" do
     setup do
-      tmp =
-        System.tmp_dir!()
-        |> Path.join("fake_s3_auth_test_#{System.unique_integer([:positive])}")
-
-      File.rm_rf!(tmp)
-      File.mkdir_p!(tmp)
-
-      System.put_env("FAKES3_DATA_DIR", tmp)
-      System.put_env("FAKES3_MODE", "static")
-      System.put_env("FAKES3_ACCESS_KEY", "test-access-key")
-      System.put_env("FAKES3_SECRET_KEY", "test-secret-key")
-
-      ref = :"fake_s3_auth_static_#{System.unique_integer([:positive])}"
-
-      {:ok, _pid} =
-        Plug.Cowboy.http(
-          FakeS3.Router,
-          [],
-          ip: {127, 0, 0, 1},
-          port: 0,
-          ref: ref
-        )
-
-      port = :ranch.get_port(ref)
-      endpoint = "http://127.0.0.1:#{port}"
+      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
+        start_server(%{
+          mode: "static",
+          access_key: "test-access-key",
+          secret_key: "test-secret-key"
+        })
 
       on_exit(fn ->
         Plug.Cowboy.shutdown(ref)
         File.rm_rf!(tmp)
-        System.put_env("FAKES3_MODE", "noauth")
-        System.delete_env("FAKES3_ACCESS_KEY")
-        System.delete_env("FAKES3_SECRET_KEY")
       end)
 
       {:ok, endpoint: endpoint}
@@ -86,38 +64,16 @@ defmodule FakeS3.AuthTest do
 
   describe "strict auth mode" do
     setup do
-      tmp =
-        System.tmp_dir!()
-        |> Path.join("fake_s3_strict_test_#{System.unique_integer([:positive])}")
-
-      File.rm_rf!(tmp)
-      File.mkdir_p!(tmp)
-
-      System.put_env("FAKES3_DATA_DIR", tmp)
-      System.put_env("FAKES3_MODE", "strict")
-      System.put_env("FAKES3_ACCESS_KEY", "strict-access-key")
-      System.put_env("FAKES3_SECRET_KEY", "strict-secret-key")
-
-      ref = :"fake_s3_auth_strict_#{System.unique_integer([:positive])}"
-
-      {:ok, _pid} =
-        Plug.Cowboy.http(
-          FakeS3.Router,
-          [],
-          ip: {127, 0, 0, 1},
-          port: 0,
-          ref: ref
-        )
-
-      port = :ranch.get_port(ref)
-      endpoint = "http://127.0.0.1:#{port}"
+      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
+        start_server(%{
+          mode: "strict",
+          access_key: "strict-access-key",
+          secret_key: "strict-secret-key"
+        })
 
       on_exit(fn ->
         Plug.Cowboy.shutdown(ref)
         File.rm_rf!(tmp)
-        System.put_env("FAKES3_MODE", "noauth")
-        System.delete_env("FAKES3_ACCESS_KEY")
-        System.delete_env("FAKES3_SECRET_KEY")
       end)
 
       {:ok, endpoint: endpoint}
@@ -172,37 +128,12 @@ defmodule FakeS3.AuthTest do
 
   describe "missing credentials error" do
     setup do
-      tmp =
-        System.tmp_dir!()
-        |> Path.join("fake_s3_nocreds_test_#{System.unique_integer([:positive])}")
-
-      File.rm_rf!(tmp)
-      File.mkdir_p!(tmp)
-
-      System.put_env("FAKES3_DATA_DIR", tmp)
-      System.put_env("FAKES3_MODE", "static")
-      # Intentionally NOT setting access/secret keys
-      System.delete_env("FAKES3_ACCESS_KEY")
-      System.delete_env("FAKES3_SECRET_KEY")
-
-      ref = :"fake_s3_nocreds_#{System.unique_integer([:positive])}"
-
-      {:ok, _pid} =
-        Plug.Cowboy.http(
-          FakeS3.Router,
-          [],
-          ip: {127, 0, 0, 1},
-          port: 0,
-          ref: ref
-        )
-
-      port = :ranch.get_port(ref)
-      endpoint = "http://127.0.0.1:#{port}"
+      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
+        start_server(%{mode: "static"})
 
       on_exit(fn ->
         Plug.Cowboy.shutdown(ref)
         File.rm_rf!(tmp)
-        System.put_env("FAKES3_MODE", "noauth")
       end)
 
       {:ok, endpoint: endpoint}
@@ -214,5 +145,30 @@ defmodule FakeS3.AuthTest do
       assert resp.status == 500
       assert resp.body =~ "missing credentials"
     end
+  end
+
+  defp start_server(config) do
+    tmp =
+      System.tmp_dir!()
+      |> Path.join("fake_s3_auth_test_#{System.unique_integer([:positive])}")
+
+    File.rm_rf!(tmp)
+    File.mkdir_p!(tmp)
+
+    ref = :"fake_s3_auth_#{System.unique_integer([:positive])}"
+
+    {:ok, _pid} =
+      Plug.Cowboy.http(
+        FakeS3.Router,
+        [config: Map.put(config, :data_dir, tmp)],
+        ip: {127, 0, 0, 1},
+        port: 0,
+        ref: ref
+      )
+
+    port = :ranch.get_port(ref)
+    endpoint = "http://127.0.0.1:#{port}"
+
+    {:ok, endpoint: endpoint, ref: ref, tmp: tmp}
   end
 end

@@ -17,10 +17,12 @@ defmodule FakeS3.S3XML do
   end
 
   def list_objects_v2(bucket, params, contents, common_prefixes, is_truncated, next_token) do
+    key_count = length(contents) + length(common_prefixes)
+
     elements = [
       element(:Name, bucket),
       element(:Prefix, params.prefix),
-      element(:KeyCount, Integer.to_string(length(contents))),
+      element(:KeyCount, Integer.to_string(key_count)),
       element(:MaxKeys, Integer.to_string(params.max_keys)),
       element(:Delimiter, params.delimiter || ""),
       element(:IsTruncated, if(is_truncated, do: "true", else: "false"))
