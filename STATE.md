@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-21
+Last updated: 2026-08-21 (branch `delta`)
 
 ## What landed
 
@@ -25,49 +25,72 @@ teardown fixture empties buckets with it; without it every test errored. FakeS3
 is unversioned, so every key is reported once as latest at version `null`.
 Covered by two new cases in `test/listing_test.exs`.
 
+**Whitespace-significant keys** — `FakeS3.XML.text/2` and `texts/2` used to
+`String.trim()` element content, so a `<Key>` of `" "` parsed as `""` and `"_ "`
+parsed as `"_"`. Bulk delete then deleted the wrong object (or none), and those
+keys could never be removed. Text extraction now preserves whitespace;
+`XML.token/2` is the explicit opt-in for values that really are tokens
+(`Quiet`, `PartNumber`, `ETag`). See "Fixed cascade" below.
+
 ## Verified
 
-- `mix test` — 105 tests, 0 failures.
+- `mix test` — 107 tests, 0 failures.
 - `mise bootstrap` — works from a clean tree (`rm -rf vendor` then bootstrap).
-- Full `test_s3.py` run completes in ~2.5 min: **122 passed, 143 failed,
-  1 skipped, 573 errors** out of 838 collected.
+- Full `test_s3.py` run, all 838 collected tests execute:
+
+  | | passed | failed | skipped | errors |
+  |---|---|---|---|---|
+  | before whitespace fix | 122 | 143 | 1 | **573** |
+  | after | **199** | 545 | 94 | **0** |
 
 Note: the ExUnit suite boots a listener on `FAKES3_PORT`, so `mix test` fails
 with `:eaddrinuse` while `mise run server` is up on the same port. Use
 `FAKES3_PORT=4599 mix test` to run both at once.
 
-## The 573 errors are one bug, not 573
+## Fixed cascade (was: 573 errors)
 
-All 573 are the same `BucketNotEmpty` on `DeleteBucket`, cascading from a single
-stuck bucket. `test_bucket_create_special_key_names` creates keys
-`' '  "  $  %  &  '  <  >  _  '_ '  '_ _'  __`. Teardown then can't empty that
-bucket, and since each subsequent test's setup nukes *all* prefixed buckets, the
-same failure re-fires for every test after it — 573 of them never run at all.
+All 573 errors were one `BucketNotEmpty` on `DeleteBucket`, cascading from a
+single stuck bucket left by `test_bucket_create_special_key_names` (keys
+`' '  "  $  %  &  '  <  >  _  '_ '  '_ _'  __`). Because each subsequent test's
+setup nukes *all* prefixed buckets, that one bucket failed every test after it.
 
-Fix that one bucket and roughly 570 tests start executing, which changes the
-real pass/fail picture far more than any individual feature would.
+Root cause was the `String.trim()` above — the two keys that survived were
+exactly the two ending in a space. Fixed in `lib/fake_s3/xml.ex`; regression
+tests in `test/bulk_delete_test.exs`. Errors are now 0 and every test runs.
 
 ## Recommended next action
 
-Make special-character keys round-trip through list → delete, so
-`nuke_bucket` can empty that bucket.
+**PUT on a bucket ignores its subresource.** The router treats every
+`PUT /:bucket` as CreateBucket, so `PUT /b?versioning`, `?acl`, `?tagging`,
+`?lifecycle` etc. all return `409 BucketAlreadyOwnedByYou` on an existing
+bucket. This is now the single largest cause: **396 of the 545 failures.**
 
-Likely culprits, in order of suspicion:
-1. XML escaping of `&`, `<`, `>`, `"` in listing output — if keys come back
-   escaped (or double-escaped), `delete_objects` sends a key that no longer
-   matches what is stored.
-2. The space-only key `' '` and trailing-space keys `'_ '` — check they survive
-   path encoding and filesystem storage.
-3. `%` in a key, given the existing `encoding-type=url` handling.
-
-Reproduce directly:
+Reproduce:
 
 ```sh
-mise run s3-tests -- s3tests/functional/test_s3.py::test_bucket_create_special_key_names
+curl -X PUT "http://127.0.0.1:4569/b"                  # 200
+curl -X PUT "http://127.0.0.1:4569/b?versioning" -d '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>'
+# => 409 BucketAlreadyOwnedByYou, should not be a CreateBucket at all
 ```
 
-Then re-run the full file and expect the error count to collapse. Only after
-that is the pass/fail breakdown worth reading as a compatibility signal.
+The fix is a routing change, mirroring the existing `dispatch_bucket_get/2`:
+add a `dispatch_bucket_put/2` that checks for a subresource before falling
+through to CreateBucket. **This needs a decision** on what those subresources
+should then do:
+
+- **501 NotImplemented** — honest, small, and unblocks the routing bug without
+  claiming features FakeS3 lacks. Tests that merely *set up* versioning will
+  still fail, but for the right reason.
+- **Accept and ignore (200)** — lets many more tests proceed, but silently lies
+  about state the tests later assert on, likely trading these failures for
+  confusing ones.
+
+Recommend 501 first, since it is separable from any decision about actually
+implementing versioning.
+
+After that, the remaining failure tail is genuine feature gaps: `KeyError`s for
+`VersionId` (28), `ETag` (14), `ChecksumAlgorithm` (14), `PartsCount` (6), plus
+14 `NotImplemented` and 6 `InvalidArgument`.
 
 ## Known loose ends
 

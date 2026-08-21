@@ -28,19 +28,38 @@ defmodule FakeS3.XML do
 
   def extract_first(_, _), do: nil
 
-  @doc "Returns the unescaped text of the first `<tag>...</tag>`, or nil."
+  @doc """
+  Returns the unescaped text of the first `<tag>...</tag>`, or nil.
+
+  Whitespace is preserved: an S3 key may legitimately begin or end with a
+  space, and " " is a valid key on its own. Callers wanting a bare token
+  (a number, a boolean) should use `token/2`.
+  """
   def text(body, tag) do
     case extract_first(body, tag) do
       nil -> nil
-      value -> value |> String.trim() |> unescape()
+      value -> unescape(value)
     end
   end
 
-  @doc "Returns the unescaped text of every `<tag>...</tag>`."
+  @doc "Returns the unescaped text of every `<tag>...</tag>`, preserving whitespace."
   def texts(body, tag) do
     body
     |> extract_all(tag)
-    |> Enum.map(&(&1 |> String.trim() |> unescape()))
+    |> Enum.map(&unescape/1)
+  end
+
+  @doc """
+  Like `text/2`, but trims surrounding whitespace.
+
+  For values that are tokens rather than user data, so a client that
+  pretty-prints its request body still parses correctly.
+  """
+  def token(body, tag) do
+    case text(body, tag) do
+      nil -> nil
+      value -> String.trim(value)
+    end
   end
 
   def unescape(value) do

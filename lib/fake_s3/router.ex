@@ -383,7 +383,7 @@ defmodule FakeS3.Router do
     case read_control_body(conn) do
       {:ok, body, conn} ->
         keys = XML.texts(body, "Key")
-        quiet? = XML.text(body, "Quiet") == "true"
+        quiet? = XML.token(body, "Quiet") == "true"
 
         {deleted, errors} =
           Enum.reduce(keys, {[], []}, fn key, {ok, failed} ->
@@ -439,7 +439,7 @@ defmodule FakeS3.Router do
           body
           |> XML.extract_all("Part")
           |> Enum.map(fn part ->
-            {parse_int(XML.text(part, "PartNumber")), XML.text(part, "ETag")}
+            {parse_int(XML.token(part, "PartNumber")), XML.token(part, "ETag")}
           end)
           |> Enum.reject(fn {number, _} -> is_nil(number) end)
 

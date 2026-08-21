@@ -56,6 +56,39 @@ defmodule FakeS3.BulkDeleteTest do
     assert %{status: 404} = Req.get!(ctx.req, url: "s3://#{ctx.bucket}/a%26b.txt")
   end
 
+  test "deletes keys whose whitespace is significant", ctx do
+    # Trimming <Key> text used to turn " " into "" and "_ " into "_", so these
+    # keys survived every delete and left the bucket permanently non-empty.
+    keys = [" ", "_ ", "_"]
+
+    for key <- keys do
+      Req.put!(ctx.req,
+        url: "s3://#{ctx.bucket}/#{URI.encode(key, &URI.char_unreserved?/1)}",
+        body: "x"
+      )
+    end
+
+    resp = delete_objects(ctx, keys)
+    assert resp.status == 200
+
+    listed = Req.get!(ctx.req, url: "s3://#{ctx.bucket}")
+    assert xml_values(listed.body, "Key") == ~w(nested/three.txt one.txt two.txt)
+  end
+
+  test "a bare space key survives a list/delete round trip", ctx do
+    Req.put!(ctx.req, url: "s3://#{ctx.bucket}/%20", body: "x")
+
+    listed = Req.get!(ctx.req, url: "s3://#{ctx.bucket}")
+    assert " " in xml_values(listed.body, "Key")
+
+    # nuke_bucket in ceph/s3-tests empties buckets via ?versions, not ListObjects.
+    versions = Req.get!(ctx.req, url: "s3://#{ctx.bucket}", params: %{"versions" => ""})
+    assert " " in xml_values(versions.body, "Key")
+
+    assert %{status: 200} = delete_objects(ctx, [" "])
+    refute " " in xml_values(Req.get!(ctx.req, url: "s3://#{ctx.bucket}").body, "Key")
+  end
+
   test "reports an error entry for a traversing key", ctx do
     body = "<Delete><Object><Key>../escape.txt</Key></Object></Delete>"
     resp = Req.post!(raw_req(), url: "#{ctx.endpoint}/#{ctx.bucket}?delete", body: body)
