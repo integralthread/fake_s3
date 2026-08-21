@@ -1,17 +1,11 @@
 defmodule FakeS3.MaxBodyTest do
   use ExUnit.Case, async: true
 
+  import FakeS3.TestServer
+
   describe "max body bytes enforcement" do
     setup do
-      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
-        start_server(%{mode: "noauth", max_body_bytes: 100})
-
-      on_exit(fn ->
-        Plug.Cowboy.shutdown(ref)
-        File.rm_rf!(tmp)
-      end)
-
-      {:ok, endpoint: endpoint}
+      FakeS3.TestServer.setup_server(%{mode: "noauth", max_body_bytes: 100})
     end
 
     test "accepts body within limit", %{endpoint: endpoint} do
@@ -100,30 +94,5 @@ defmodule FakeS3.MaxBodyTest do
       # Cleanup
       Req.delete!(req, url: "s3://#{bucket}")
     end
-  end
-
-  defp start_server(config) do
-    tmp =
-      System.tmp_dir!()
-      |> Path.join("fake_s3_maxbody_test_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(tmp)
-    File.mkdir_p!(tmp)
-
-    ref = :"fake_s3_maxbody_#{System.unique_integer([:positive])}"
-
-    {:ok, _pid} =
-      Plug.Cowboy.http(
-        FakeS3.Router,
-        [config: Map.put(config, :data_dir, tmp)],
-        ip: {127, 0, 0, 1},
-        port: 0,
-        ref: ref
-      )
-
-    port = :ranch.get_port(ref)
-    endpoint = "http://127.0.0.1:#{port}"
-
-    {:ok, endpoint: endpoint, ref: ref, tmp: tmp}
   end
 end

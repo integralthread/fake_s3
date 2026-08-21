@@ -2,6 +2,7 @@ defmodule FakeS3.Metadata do
   @moduledoc false
 
   alias FakeS3.Storage
+  alias FakeS3.Time
 
   @standard_headers [
     "cache-control",
@@ -16,7 +17,7 @@ defmodule FakeS3.Metadata do
       bucket: bucket,
       size: size,
       etag: etag,
-      last_modified: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      last_modified: Time.now_iso(),
       content_type: content_type,
       headers: headers,
       user_metadata: user_meta
@@ -29,6 +30,8 @@ defmodule FakeS3.Metadata do
     standard =
       lowered
       |> Enum.filter(fn {k, _} -> k in @standard_headers end)
+      |> Enum.map(&strip_transfer_encoding/1)
+      |> Enum.reject(fn {_k, v} -> v == "" end)
       |> Map.new()
 
     user =
@@ -38,6 +41,22 @@ defmodule FakeS3.Metadata do
 
     {standard, user}
   end
+
+  # aws-chunked describes how the body was framed on the wire, not how the
+  # stored object is encoded. Echoing it back on GET would tell the client to
+  # un-frame a payload that was already decoded on the way in.
+  defp strip_transfer_encoding({"content-encoding", value}) do
+    cleaned =
+      value
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(String.downcase(&1) == "aws-chunked"))
+      |> Enum.join(", ")
+
+    {"content-encoding", cleaned}
+  end
+
+  defp strip_transfer_encoding(header), do: header
 
   def write_object_meta(bucket, key, meta) do
     Storage.write_json_atomic(Storage.object_meta_path(bucket, key), meta)

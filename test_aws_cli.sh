@@ -288,6 +288,81 @@ else
 fi
 
 echo
+echo "--- MULTIPART UPLOAD ---"
+echo
+
+# Anything over the CLI's 8MB threshold goes through CreateMultipartUpload.
+info "Uploading a 20MB file (forces multipart)..."
+dd if=/dev/urandom of=/tmp/fakes3_test_big.bin bs=1048576 count=20 2>/dev/null
+aws_s3 cp /tmp/fakes3_test_big.bin "s3://$BUCKET/big.bin" --no-progress
+pass "Multipart upload completed"
+
+info "Verifying multipart round-trip integrity..."
+aws_s3 cp "s3://$BUCKET/big.bin" /tmp/fakes3_test_big_out.bin --no-progress
+if cmp -s /tmp/fakes3_test_big.bin /tmp/fakes3_test_big_out.bin; then
+    pass "Downloaded bytes match the original"
+else
+    fail "Multipart round-trip corrupted the object"
+fi
+
+info "Checking composite ETag format..."
+BIG_ETAG=$(aws_s3api head-object --bucket "$BUCKET" --key "big.bin" --query 'ETag' --output text)
+if echo "$BIG_ETAG" | grep -qE '^"?[0-9a-f]{32}-[0-9]+"?$'; then
+    pass "Multipart ETag has the <md5>-<parts> form: $BIG_ETAG"
+else
+    fail "Unexpected multipart ETag: $BIG_ETAG"
+fi
+
+info "Checking reported size..."
+BIG_LEN=$(aws_s3api head-object --bucket "$BUCKET" --key "big.bin" --query 'ContentLength' --output text)
+[ "$BIG_LEN" = "20971520" ] && pass "HEAD reports $BIG_LEN bytes" || fail "HEAD reported $BIG_LEN"
+
+info "Aborting an upload..."
+UPLOAD_ID=$(aws_s3api create-multipart-upload --bucket "$BUCKET" --key "aborted.bin" --query 'UploadId' --output text)
+aws_s3api abort-multipart-upload --bucket "$BUCKET" --key "aborted.bin" --upload-id "$UPLOAD_ID"
+pass "Aborted multipart upload"
+
+echo
+echo "--- LIST VARIANTS ---"
+echo
+
+info "ListObjects v1..."
+aws_s3api list-objects --bucket "$BUCKET" --max-keys 2 > /dev/null
+pass "list-objects (v1) succeeded"
+
+info "GetBucketLocation..."
+aws_s3api get-bucket-location --bucket "$BUCKET" > /dev/null
+pass "get-bucket-location succeeded"
+
+echo
+echo "--- RANGE REQUESTS ---"
+echo
+
+info "Ranged GET..."
+echo -n "hello world" | aws_s3 cp - "s3://$BUCKET/range.txt"
+RANGE_OUT=$(aws_s3api get-object --bucket "$BUCKET" --key "range.txt" --range "bytes=0-4" /tmp/fakes3_test_range.txt > /dev/null && cat /tmp/fakes3_test_range.txt)
+[ "$RANGE_OUT" = "hello" ] && pass "Range returned '$RANGE_OUT'" || fail "Range returned '$RANGE_OUT'"
+
+info "Unsatisfiable range returns 416..."
+if aws_s3api get-object --bucket "$BUCKET" --key "range.txt" --range "bytes=9999-99999" /tmp/fakes3_test_range2.txt 2>&1 | grep -qi "416\|InvalidRange\|Requested Range"; then
+    pass "416 InvalidRange returned"
+else
+    fail "Expected 416 for an unsatisfiable range"
+fi
+
+echo
+echo "--- BULK DELETE ---"
+echo
+
+info "delete-objects with multiple keys..."
+echo "x" | aws_s3 cp - "s3://$BUCKET/bulk1.txt"
+echo "y" | aws_s3 cp - "s3://$BUCKET/bulk2.txt"
+DELETED=$(aws_s3api delete-objects --bucket "$BUCKET" \
+    --delete 'Objects=[{Key=bulk1.txt},{Key=bulk2.txt}]' \
+    --query 'length(Deleted)' --output text)
+[ "$DELETED" = "2" ] && pass "Bulk deleted $DELETED objects" || fail "Bulk delete reported $DELETED"
+
+echo
 echo "--- DELETE OPERATIONS ---"
 echo
 

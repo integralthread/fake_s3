@@ -1,21 +1,15 @@
 defmodule FakeS3.AuthTest do
   use ExUnit.Case, async: true
 
+  import FakeS3.TestServer
+
   describe "static auth mode" do
     setup do
-      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
-        start_server(%{
-          mode: "static",
-          access_key: "test-access-key",
-          secret_key: "test-secret-key"
-        })
-
-      on_exit(fn ->
-        Plug.Cowboy.shutdown(ref)
-        File.rm_rf!(tmp)
-      end)
-
-      {:ok, endpoint: endpoint}
+      FakeS3.TestServer.setup_server(%{
+        mode: "static",
+        access_key: "test-access-key",
+        secret_key: "test-secret-key"
+      })
     end
 
     test "accepts valid credentials", %{endpoint: endpoint} do
@@ -64,19 +58,11 @@ defmodule FakeS3.AuthTest do
 
   describe "strict auth mode" do
     setup do
-      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
-        start_server(%{
-          mode: "strict",
-          access_key: "strict-access-key",
-          secret_key: "strict-secret-key"
-        })
-
-      on_exit(fn ->
-        Plug.Cowboy.shutdown(ref)
-        File.rm_rf!(tmp)
-      end)
-
-      {:ok, endpoint: endpoint}
+      FakeS3.TestServer.setup_server(%{
+        mode: "strict",
+        access_key: "strict-access-key",
+        secret_key: "strict-secret-key"
+      })
     end
 
     test "accepts valid credentials in strict mode", %{endpoint: endpoint} do
@@ -128,47 +114,15 @@ defmodule FakeS3.AuthTest do
 
   describe "missing credentials error" do
     setup do
-      {:ok, endpoint: endpoint, ref: ref, tmp: tmp} =
-        start_server(%{mode: "static"})
-
-      on_exit(fn ->
-        Plug.Cowboy.shutdown(ref)
-        File.rm_rf!(tmp)
-      end)
-
-      {:ok, endpoint: endpoint}
+      FakeS3.TestServer.setup_server(%{mode: "static"})
     end
 
     test "returns 500 when credentials not configured", %{endpoint: endpoint} do
       bucket = "nocreds-bucket-#{System.unique_integer([:positive])}"
       resp = Req.put!(Req.new(), url: "#{endpoint}/#{bucket}")
       assert resp.status == 500
-      assert resp.body =~ "missing credentials"
+      assert resp.body =~ "<Code>InternalError</Code>"
+      assert resp.body =~ "no credentials are configured"
     end
-  end
-
-  defp start_server(config) do
-    tmp =
-      System.tmp_dir!()
-      |> Path.join("fake_s3_auth_test_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(tmp)
-    File.mkdir_p!(tmp)
-
-    ref = :"fake_s3_auth_#{System.unique_integer([:positive])}"
-
-    {:ok, _pid} =
-      Plug.Cowboy.http(
-        FakeS3.Router,
-        [config: Map.put(config, :data_dir, tmp)],
-        ip: {127, 0, 0, 1},
-        port: 0,
-        ref: ref
-      )
-
-    port = :ranch.get_port(ref)
-    endpoint = "http://127.0.0.1:#{port}"
-
-    {:ok, endpoint: endpoint, ref: ref, tmp: tmp}
   end
 end

@@ -22,3 +22,9 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 fake_s3-*.tar
 
+# Language server workspace.
+/.elixir_ls/
+
+# Default FAKES3_DATA_DIR.
+/.fakes3/
+

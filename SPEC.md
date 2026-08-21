@@ -297,3 +297,21 @@ v2:
 	•	CopyObject
 	•	Multipart (create, upload parts, complete) if your app needs it
 	•	Better SigV4 strictness
+
+⸻
+
+14) Implementation Status
+
+v1 and v2 are both implemented. Beyond the original scope:
+
+	•	ListObjects v1, DeleteObjects (bulk), GetBucketLocation/Versioning/Acl —
+	  needed because the AWS CLI and boto3 call them during ordinary operations.
+	•	aws-chunked request body decoding — SDKs frame bodies this way whenever
+	  checksums are enabled; storing the framing corrupts the object.
+	•	Presigned URL (query string) authentication with expiry checking.
+	•	encoding-type=url on listings, so keys containing '%' or '+' survive a
+	  round trip through a client that percent-decodes them.
+
+Deliberate divergences are listed under "Known divergences from S3" in the
+README. The most significant: keys and prefixes cannot collide, because
+objects are stored as files.

@@ -16,6 +16,17 @@ defmodule FakeS3.Storage do
     Path.join([bucket_dir(bucket), "meta"])
   end
 
+  # Scratch space for temp+rename. Deliberately a sibling of objects/ so that
+  # a partial or orphaned write can never be mistaken for a stored object by
+  # list_keys/2 or bucket_empty?/1.
+  def tmp_dir(bucket) do
+    Path.join([bucket_dir(bucket), "tmp"])
+  end
+
+  def uploads_dir(bucket) do
+    Path.join([bucket_dir(bucket), "uploads"])
+  end
+
   def bucket_meta_path(bucket) do
     Path.join([bucket_dir(bucket), "bucket.json"])
   end
@@ -31,7 +42,8 @@ defmodule FakeS3.Storage do
 
   def ensure_bucket_dirs(bucket) do
     with :ok <- File.mkdir_p(objects_dir(bucket)),
-         :ok <- File.mkdir_p(meta_dir(bucket)) do
+         :ok <- File.mkdir_p(meta_dir(bucket)),
+         :ok <- File.mkdir_p(tmp_dir(bucket)) do
       :ok
     end
   end
@@ -69,12 +81,16 @@ defmodule FakeS3.Storage do
     buckets_root = Path.join([Config.data_dir(), "buckets"])
     File.mkdir_p(buckets_root)
 
-    with {:ok, entries} <- File.ls(buckets_root) do
-      entries
-      |> Enum.filter(&File.dir?(Path.join(buckets_root, &1)))
-      |> Enum.map(&bucket_meta(&1))
-      |> Enum.reject(&is_nil/1)
-      |> Enum.sort_by(& &1.name)
+    case File.ls(buckets_root) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&File.dir?(Path.join(buckets_root, &1)))
+        |> Enum.map(&bucket_meta(&1))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.sort_by(& &1.name)
+
+      {:error, _} ->
+        []
     end
   end
 
@@ -96,23 +112,77 @@ defmodule FakeS3.Storage do
     end
   end
 
+  @doc """
+  Rejects keys that cannot be represented on a filesystem because another key
+  already occupies part of their path.
+
+  S3's keyspace is flat, so `a` and `a/b` may coexist there. Backed by
+  directories they cannot, and silently accepting the second write would lose
+  data. Callers surface this as an explicit error instead.
+  """
+  def check_key_conflict(bucket, key) do
+    root = objects_dir(bucket)
+    segments = Key.key_path(key)
+
+    cond do
+      ancestor_file?(root, segments) -> {:error, :key_conflict}
+      File.dir?(Path.join([root | segments])) -> {:error, :key_conflict}
+      true -> :ok
+    end
+  end
+
+  defp ancestor_file?(root, segments) do
+    segments
+    |> Enum.drop(-1)
+    |> Enum.reduce_while(root, fn segment, path ->
+      next = Path.join(path, segment)
+      if File.regular?(next), do: {:halt, :conflict}, else: {:cont, next}
+    end)
+    |> Kernel.==(:conflict)
+  end
+
+  @doc """
+  Streams an object into place via temp+rename.
+
+  `fun` receives an open IO device and returns `{:ok, payload}` or
+  `{:error, reason}`; the payload is handed back to the caller so it can build
+  metadata from whatever the writer computed (size, etag).
+  """
   def put_object(bucket, key, fun) do
     content_path = object_path(bucket, key)
     meta_path = object_meta_path(bucket, key)
-    File.mkdir_p(Path.dirname(content_path))
-    File.mkdir_p(Path.dirname(meta_path))
 
-    temp_path = content_path <> ".tmp-" <> unique_suffix()
+    with :ok <- check_key_conflict(bucket, key),
+         :ok <- File.mkdir_p(tmp_dir(bucket)),
+         :ok <- File.mkdir_p(Path.dirname(content_path)),
+         :ok <- File.mkdir_p(Path.dirname(meta_path)),
+         {:ok, payload, temp_path} <- write_temp(bucket, fun),
+         :ok <- rename(temp_path, content_path) do
+      {:ok, meta_path, payload}
+    end
+  end
+
+  @doc """
+  Writes to a temp file in the bucket's scratch dir and hands back the path.
+
+  The caller owns the temp file from here: rename it into place or remove it.
+  """
+  def write_temp(bucket, fun) do
+    File.mkdir_p(tmp_dir(bucket))
+    temp_path = Path.join(tmp_dir(bucket), "tmp-" <> unique_suffix())
 
     case File.open(temp_path, [:write, :binary]) do
       {:ok, io} ->
-        result = fun.(io)
-        File.close(io)
+        result =
+          try do
+            fun.(io)
+          after
+            File.close(io)
+          end
 
         case result do
           {:ok, payload} ->
-            File.rename(temp_path, content_path)
-            {:ok, meta_path, payload}
+            {:ok, payload, temp_path}
 
           {:error, reason} ->
             File.rm(temp_path)
@@ -124,8 +194,20 @@ defmodule FakeS3.Storage do
         end
 
       {:error, reason} ->
-        File.rm(temp_path)
         {:error, reason}
+    end
+  end
+
+  # A failed rename previously went unnoticed, so the caller reported 200 OK
+  # for an object that was never stored. Always surface it.
+  defp rename(temp_path, target_path) do
+    case File.rename(temp_path, target_path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        File.rm(temp_path)
+        {:error, {:rename_failed, reason}}
     end
   end
 
@@ -148,9 +230,8 @@ defmodule FakeS3.Storage do
     content_path = object_path(bucket, key)
     meta_path = object_meta_path(bucket, key)
 
-    with true <- File.exists?(content_path),
-         {:ok, meta} <- read_json(meta_path),
-         {:ok, stat} <- File.stat(content_path) do
+    with {:ok, %File.Stat{type: :regular} = stat} <- File.stat(content_path),
+         {:ok, meta} <- read_json(meta_path) do
       {:ok, %{content_path: content_path, meta: meta, stat: stat}}
     else
       _ -> {:error, :not_found}
@@ -160,41 +241,129 @@ defmodule FakeS3.Storage do
   def delete_object(bucket, key) do
     content_path = object_path(bucket, key)
     meta_path = object_meta_path(bucket, key)
+
     File.rm(content_path)
     File.rm(meta_path)
+
+    # Leaving the directory behind would block a later PUT of the parent key.
+    prune_empty_dirs(Path.dirname(content_path), objects_dir(bucket))
+    prune_empty_dirs(Path.dirname(meta_path), meta_dir(bucket))
+
     :ok
   end
 
-  def copy_object(src_bucket, src_key, dest_bucket, dest_key) do
+  defp prune_empty_dirs(dir, root) do
+    if dir != root and String.starts_with?(dir, root <> "/") do
+      case File.rmdir(dir) do
+        :ok -> prune_empty_dirs(Path.dirname(dir), root)
+        _ -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  @doc """
+  Copies an object, optionally replacing its metadata.
+
+  `replacement` is `nil` to carry the source metadata over (the COPY
+  directive), or a map of `:content_type`, `:headers` and `:user_metadata` to
+  replace it (REPLACE).
+  """
+  def copy_object(src_bucket, src_key, dest_bucket, dest_key, replacement \\ nil) do
+    same_object? = src_bucket == dest_bucket and src_key == dest_key
+
     case read_object(src_bucket, src_key) do
       {:ok, %{content_path: src_content_path, meta: src_meta}} ->
-        dest_content_path = object_path(dest_bucket, dest_key)
-        dest_meta_path = object_meta_path(dest_bucket, dest_key)
+        cond do
+          # Copying onto itself with File.copy/2 truncates the source before
+          # reading it. S3 rejects this outright unless metadata is replaced.
+          same_object? and is_nil(replacement) ->
+            {:error, :copy_onto_self}
 
-        File.mkdir_p(Path.dirname(dest_content_path))
-        File.mkdir_p(Path.dirname(dest_meta_path))
+          same_object? ->
+            write_copy_meta(dest_bucket, dest_key, src_meta, replacement)
 
-        case File.copy(src_content_path, dest_content_path) do
-          {:ok, _} ->
-            last_modified = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-
-            new_meta = %{
-              src_meta
-              | "key" => dest_key,
-                "bucket" => dest_bucket,
-                "last_modified" => last_modified
-            }
-
-            :ok = write_json_atomic(dest_meta_path, new_meta)
-            {:ok, %{etag: src_meta["etag"], last_modified: last_modified}}
-
-          {:error, reason} ->
-            {:error, reason}
+          true ->
+            copy_content(
+              src_bucket,
+              src_content_path,
+              dest_bucket,
+              dest_key,
+              src_meta,
+              replacement
+            )
         end
 
       {:error, :not_found} ->
         {:error, :source_not_found}
     end
+  end
+
+  defp copy_content(src_bucket, src_content_path, dest_bucket, dest_key, src_meta, replacement) do
+    dest_content_path = object_path(dest_bucket, dest_key)
+
+    with :ok <- check_key_conflict(dest_bucket, dest_key),
+         :ok <- File.mkdir_p(Path.dirname(dest_content_path)),
+         {:ok, _, temp_path} <- write_temp(src_bucket, &stream_copy(src_content_path, &1)),
+         :ok <- rename(temp_path, dest_content_path) do
+      write_copy_meta(dest_bucket, dest_key, src_meta, replacement)
+    end
+  end
+
+  defp stream_copy(src_path, io) do
+    case File.open(src_path, [:read, :binary]) do
+      {:ok, src_io} ->
+        try do
+          copy_loop(src_io, io)
+        after
+          File.close(src_io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp copy_loop(src_io, dest_io) do
+    case IO.binread(src_io, 1_048_576) do
+      :eof ->
+        {:ok, :copied}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      data ->
+        case IO.binwrite(dest_io, data) do
+          :ok -> copy_loop(src_io, dest_io)
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp write_copy_meta(dest_bucket, dest_key, src_meta, replacement) do
+    last_modified = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    new_meta =
+      src_meta
+      |> Map.put("key", dest_key)
+      |> Map.put("bucket", dest_bucket)
+      |> Map.put("last_modified", DateTime.to_iso8601(last_modified))
+      |> apply_replacement(replacement)
+
+    case write_json_atomic(object_meta_path(dest_bucket, dest_key), new_meta) do
+      :ok -> {:ok, %{etag: src_meta["etag"], last_modified: last_modified}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp apply_replacement(meta, nil), do: meta
+
+  defp apply_replacement(meta, replacement) do
+    meta
+    |> Map.put("content_type", replacement.content_type)
+    |> Map.put("headers", replacement.headers)
+    |> Map.put("user_metadata", replacement.user_metadata)
   end
 
   def list_keys(bucket) do
@@ -208,10 +377,11 @@ defmodule FakeS3.Storage do
         dir
         |> walk_files()
         |> Enum.map(fn path ->
-          Path.relative_to(path, dir)
+          path
+          |> Path.relative_to(dir)
+          |> Path.split()
+          |> Enum.join("/")
         end)
-        |> Enum.map(&Path.split/1)
-        |> Enum.map(&Enum.join(&1, "/"))
         |> Enum.sort()
     end
   end
@@ -223,7 +393,7 @@ defmodule FakeS3.Storage do
     end
   end
 
-  defp unique_suffix do
+  def unique_suffix do
     8
     |> :crypto.strong_rand_bytes()
     |> Base.encode16(case: :lower)
@@ -267,13 +437,12 @@ defmodule FakeS3.Storage do
   end
 
   def debug_list_all_objects do
-    buckets = list_buckets() || []
-
-    Enum.flat_map(buckets, fn bucket_meta ->
+    Enum.flat_map(list_buckets(), fn bucket_meta ->
       bucket = bucket_meta.name
-      keys = list_keys(bucket)
 
-      Enum.map(keys, fn key ->
+      bucket
+      |> list_keys()
+      |> Enum.map(fn key ->
         case read_object(bucket, key) do
           {:ok, %{meta: meta, stat: stat}} ->
             %{

@@ -1,16 +1,5 @@
 defmodule FakeS3.ContractReqS3Test do
-  use ExUnit.Case, async: true
-
-  setup_all do
-    {:ok, endpoint: endpoint, ref: ref, tmp: tmp} = start_server(%{mode: "noauth"})
-
-    on_exit(fn ->
-      Plug.Cowboy.shutdown(ref)
-      File.rm_rf!(tmp)
-    end)
-
-    {:ok, endpoint: endpoint}
-  end
+  use FakeS3.TestServer, config: %{mode: "noauth"}
 
   test "bucket lifecycle and object CRUD", %{endpoint: endpoint} do
     bucket = unique_bucket()
@@ -123,57 +112,6 @@ defmodule FakeS3.ContractReqS3Test do
     assert %{status: 204} = Req.delete!(req, url: "s3://#{bucket}")
   end
 
-  defp s3_req(endpoint) do
-    Req.new(decode_body: false)
-    |> ReqS3.attach(
-      aws_endpoint_url_s3: endpoint,
-      aws_sigv4: [
-        access_key_id: "test",
-        secret_access_key: "test",
-        region: "us-east-1"
-      ]
-    )
-  end
-
-  defp unique_bucket do
-    "test-bucket-#{System.unique_integer([:positive])}"
-  end
-
-  defp header_value(headers, key) do
-    headers
-    |> Enum.find(fn {k, _} -> String.downcase(k) == key end)
-    |> case do
-      {_, [v | _]} -> v
-      {_, v} when is_binary(v) -> v
-      nil -> nil
-    end
-  end
-
-  defp start_server(config) do
-    tmp =
-      System.tmp_dir!()
-      |> Path.join("fake_s3_test_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(tmp)
-    File.mkdir_p!(tmp)
-
-    ref = :"fake_s3_test_#{System.unique_integer([:positive])}"
-
-    {:ok, _pid} =
-      Plug.Cowboy.http(
-        FakeS3.Router,
-        [config: Map.put(config, :data_dir, tmp)],
-        ip: {127, 0, 0, 1},
-        port: 0,
-        ref: ref
-      )
-
-    port = :ranch.get_port(ref)
-    endpoint = "http://127.0.0.1:#{port}"
-
-    {:ok, endpoint: endpoint, ref: ref, tmp: tmp}
-  end
-
   test "range requests return partial content", %{endpoint: endpoint} do
     bucket = unique_bucket()
     req = s3_req(endpoint)
@@ -254,7 +192,10 @@ defmodule FakeS3.ContractReqS3Test do
     assert header_value(resp.headers, "x-amz-meta-custom-key") == "custom-value"
     assert header_value(resp.headers, "x-amz-meta-another") == "another-value"
     assert header_value(resp.headers, "cache-control") == "max-age=3600"
-    assert header_value(resp.headers, "content-disposition") == "attachment; filename=\"test.txt\""
+
+    assert header_value(resp.headers, "content-disposition") ==
+             "attachment; filename=\"test.txt\""
+
     assert header_value(resp.headers, "content-type") == "text/plain; charset=utf-8"
 
     # Head object also returns metadata
