@@ -32,9 +32,14 @@ keys could never be removed. Text extraction now preserves whitespace;
 `XML.token/2` is the explicit opt-in for values that really are tokens
 (`Quiet`, `PartNumber`, `ETag`). See "Fixed cascade" below.
 
+**Bucket PUT dispatch** — `dispatch_bucket_put/2` in `router.ex` routes
+`PUT /:bucket?<subresource>` to 501 instead of misreading it as CreateBucket.
+See "PUT subresource routing" below; it corrects the status code but does not
+change any test outcome.
+
 ## Verified
 
-- `mix test` — 107 tests, 0 failures (on the updated deps).
+- `mix test` — 112 tests, 0 failures (on the updated deps).
 - `mise run check` — lint + compile + test, all green.
 - `./test_aws_cli.sh` — passes against a live server, exit 0.
 - `mise bootstrap` — works from a clean tree (`rm -rf vendor` then bootstrap).
@@ -62,37 +67,69 @@ tests in `test/bulk_delete_test.exs`. Errors are now 0 and every test runs.
 
 ## Recommended next action
 
-**PUT on a bucket ignores its subresource.** The router treats every
-`PUT /:bucket` as CreateBucket, so `PUT /b?versioning`, `?acl`, `?tagging`,
-`?lifecycle` etc. all return `409 BucketAlreadyOwnedByYou` on an existing
-bucket. This is now the single largest cause: **396 of the 545 failures.**
+**Implement bucket versioning**, starting with `PUT /:bucket?versioning` and
+the `VersionId` plumbing behind it.
 
-Reproduce:
+This is now the only way to move the number. See "PUT subresource routing"
+below for why the routing fix alone changed nothing: those tests fail in
+*setup*, and setup only succeeds if versioning genuinely works. The 501 they
+get now is honest, but it is still a failure.
 
-```sh
-curl -X PUT "http://127.0.0.1:4569/b"                  # 200
-curl -X PUT "http://127.0.0.1:4569/b?versioning" -d '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>'
-# => 409 BucketAlreadyOwnedByYou, should not be a CreateBucket at all
-```
+Scope, roughly in dependency order:
 
-The fix is a routing change, mirroring the existing `dispatch_bucket_get/2`:
-add a `dispatch_bucket_put/2` that checks for a subresource before falling
-through to CreateBucket. **This needs a decision** on what those subresources
-should then do:
+1. `PUT /:bucket?versioning` stores Enabled/Suspended per bucket, and
+   `GET /:bucket?versioning` reflects it back (currently a static stub).
+2. Object writes to a versioned bucket keep prior versions and return
+   `x-amz-version-id`; this is the storage-layer change and the real work,
+   since objects are currently plain files at their key path.
+3. `GET`/`HEAD`/`DELETE` accept `?versionId=`, and DELETE without one inserts
+   a delete marker.
+4. `ListObjectVersions` reports real versions instead of today's single
+   `null` entry per key.
 
-- **501 NotImplemented** — honest, small, and unblocks the routing bug without
-  claiming features FakeS3 lacks. Tests that merely *set up* versioning will
-  still fail, but for the right reason.
-- **Accept and ignore (200)** — lets many more tests proceed, but silently lies
-  about state the tests later assert on, likely trading these failures for
-  confusing ones.
+Steps 1 and 4 are cheap; step 2 is a storage redesign and the point at which
+this stops being a small change. Worth deciding whether FakeS3 wants versioning
+at all before starting — "no versioning" is a legitimate, documented position
+for a dev/test fake, and the alternative is to accept that this tail of the
+suite stays red.
 
-Recommend 501 first, since it is separable from any decision about actually
-implementing versioning.
+The rest of the failure tail is separate feature gaps: `KeyError`s for `ETag`
+(14), `ChecksumAlgorithm` (14), `PartsCount` (6), plus 6 `InvalidArgument` and
+4 `NoSuchUpload`.
 
-After that, the remaining failure tail is genuine feature gaps: `KeyError`s for
-`VersionId` (28), `ETag` (14), `ChecksumAlgorithm` (14), `PartsCount` (6), plus
-14 `NotImplemented` and 6 `InvalidArgument`.
+## PUT subresource routing — fixed, and it moved nothing
+
+**The fix is correct and the totals did not budge.** Both facts matter.
+
+The router treated every `PUT /:bucket` as CreateBucket, so `?versioning`,
+`?acl`, `?tagging` etc. returned `409 BucketAlreadyOwnedByYou` against a bucket
+that already existed. `dispatch_bucket_put/2` now checks for a known bucket
+subresource first and returns 501; unknown query parameters (`?x-id=...`) still
+fall through to CreateBucket, so plain creation cannot break.
+
+What it bought, measured over the full suite:
+
+| | before | after |
+|---|---|---|
+| `BucketAlreadyOwnedByYou` | 396 | 3 |
+| `NotImplemented` | 14 | 408 |
+| passed / failed / skipped | 199 / 545 / 94 | **199 / 545 / 94** |
+
+The passing set is byte-identical — verified by diffing the `PASSED` lists from
+a run on each side of the change. Zero regressions, zero new passes.
+
+So the earlier framing of this as "396 of the 545 failures" was misleading: it
+was the top *error code*, not 396 fixable tests. Those tests call
+`PutBucketVersioning` in setup and then assert on versioned behaviour; changing
+409 to 501 makes the failure honest without making the test pass. Only real
+versioning does that.
+
+Kept because a wrong status code is a real bug — a client cannot distinguish
+"bucket name taken" from "operation unsupported" — and because it removes 396
+misleading errors from the output. Tests in `test/listing_test.exs`
+("bucket PUT dispatch"), covering 501 for `?versioning`/`?acl`, 404 on a
+missing bucket, 409 still returned for a genuine bare-PUT conflict, and
+fall-through for unknown parameters.
 
 ## Known loose ends
 

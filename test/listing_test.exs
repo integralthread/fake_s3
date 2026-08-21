@@ -163,6 +163,54 @@ defmodule FakeS3.ListingTest do
     end
   end
 
+  describe "bucket PUT dispatch" do
+    setup %{endpoint: endpoint} do
+      {:ok, bucket: create_bucket!(endpoint), req: s3_req(endpoint)}
+    end
+
+    test "?versioning is not treated as CreateBucket", %{req: req, bucket: bucket} do
+      # Used to return 409 BucketAlreadyOwnedByYou, because every PUT on a
+      # bucket path was routed to CreateBucket regardless of subresource.
+      resp = put_subresource(req, bucket, "versioning")
+
+      assert resp.status == 501
+      assert resp.body =~ "<Code>NotImplemented</Code>"
+    end
+
+    test "?acl is not treated as CreateBucket", %{req: req, bucket: bucket} do
+      resp = put_subresource(req, bucket, "acl")
+
+      assert resp.status == 501
+      assert resp.body =~ "<Code>NotImplemented</Code>"
+    end
+
+    test "a subresource on a missing bucket 404s", %{req: req} do
+      resp = put_subresource(req, "no-such-bucket-xyz", "versioning")
+
+      assert resp.status == 404
+      assert resp.body =~ "<Code>NoSuchBucket</Code>"
+    end
+
+    test "a bare PUT on an existing bucket still conflicts", %{req: req, bucket: bucket} do
+      resp = Req.put!(req, url: "s3://#{bucket}")
+
+      assert resp.status == 409
+      assert resp.body =~ "<Code>BucketAlreadyOwnedByYou</Code>"
+    end
+
+    test "an unrecognised query parameter still creates the bucket", %{endpoint: endpoint} do
+      # SDKs append things like ?x-id=CreateBucket; only known subresources
+      # should divert away from bucket creation.
+      resp =
+        Req.put!(s3_req(endpoint),
+          url: "s3://#{unique_bucket()}",
+          params: %{"x-id" => "CreateBucket"}
+        )
+
+      assert resp.status == 200
+    end
+  end
+
   describe "bucket subresources" do
     setup %{endpoint: endpoint} do
       {:ok, bucket: create_bucket!(endpoint), req: s3_req(endpoint)}
@@ -236,6 +284,10 @@ defmodule FakeS3.ListingTest do
 
   defp list(req, bucket, params) do
     Req.get!(req, url: "s3://#{bucket}", params: params)
+  end
+
+  defp put_subresource(req, bucket, name) do
+    Req.put!(req, url: "s3://#{bucket}", params: %{name => ""}, body: "")
   end
 
   # Follows continuation tokens to exhaustion, failing loudly rather than

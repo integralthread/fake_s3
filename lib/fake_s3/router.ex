@@ -41,16 +41,7 @@ defmodule FakeS3.Router do
   end
 
   put "/:bucket" do
-    with :ok <- validate_bucket(bucket),
-         false <- Storage.bucket_exists?(bucket),
-         :ok <- Storage.create_bucket(bucket, Time.now_iso()) do
-      conn
-      |> put_resp_header("location", "/" <> bucket)
-      |> send_resp(200, "")
-    else
-      true -> s3_error(conn, :bucket_already_exists, "/#{bucket}")
-      {:error, reason} -> s3_error(conn, reason, "/#{bucket}")
-    end
+    dispatch_bucket_put(conn, bucket)
   end
 
   head "/:bucket" do
@@ -200,6 +191,48 @@ defmodule FakeS3.Router do
 
   match _ do
     s3_error(conn, :not_implemented, conn.request_path)
+  end
+
+  ## Bucket PUT dispatch
+
+  # The bucket-level configuration subresources S3 defines for PUT. Anything
+  # not listed falls through to CreateBucket, so an unrecognised query
+  # parameter cannot break plain bucket creation.
+  @bucket_put_subresources ~w(accelerate acl analytics cors encryption
+                              intelligent-tiering inventory lifecycle logging
+                              metrics notification object-lock ownershipControls
+                              policy publicAccessBlock replication requestPayment
+                              tagging versioning website)
+
+  # A PUT on a bucket path is CreateBucket only when it carries no subresource.
+  # Routing `?versioning`, `?acl` and friends into CreateBucket made every one
+  # of them fail with 409 BucketAlreadyOwnedByYou against a bucket that already
+  # existed, which is what most of the ceph/s3-tests setup does.
+  defp dispatch_bucket_put(conn, bucket) do
+    if Enum.any?(@bucket_put_subresources, &Map.has_key?(conn.query_params, &1)) do
+      with :ok <- validate_bucket(bucket),
+           true <- Storage.bucket_exists?(bucket) do
+        s3_error(conn, :not_implemented, "/#{bucket}")
+      else
+        false -> s3_error(conn, :no_such_bucket, "/#{bucket}")
+        {:error, reason} -> s3_error(conn, reason, "/#{bucket}")
+      end
+    else
+      handle_create_bucket(conn, bucket)
+    end
+  end
+
+  defp handle_create_bucket(conn, bucket) do
+    with :ok <- validate_bucket(bucket),
+         false <- Storage.bucket_exists?(bucket),
+         :ok <- Storage.create_bucket(bucket, Time.now_iso()) do
+      conn
+      |> put_resp_header("location", "/" <> bucket)
+      |> send_resp(200, "")
+    else
+      true -> s3_error(conn, :bucket_already_exists, "/#{bucket}")
+      {:error, reason} -> s3_error(conn, reason, "/#{bucket}")
+    end
   end
 
   ## Bucket GET dispatch
