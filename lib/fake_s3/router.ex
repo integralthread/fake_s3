@@ -217,6 +217,9 @@ defmodule FakeS3.Router do
       Map.has_key?(params, "acl") ->
         xml_resp(conn, 200, S3XML.access_control_policy())
 
+      Map.has_key?(params, "versions") ->
+        handle_list_objects(conn, bucket, :versions)
+
       Map.has_key?(params, "uploads") ->
         xml_resp(
           conn,
@@ -511,6 +514,9 @@ defmodule FakeS3.Router do
 
             :v1 ->
               S3XML.list_objects_v1(bucket, params, contents, prefixes, truncated?, next_key)
+
+            :versions ->
+              S3XML.list_object_versions(bucket, params, contents, prefixes, truncated?, next_key)
           end
 
         xml_resp(conn, 200, xml)
@@ -527,7 +533,8 @@ defmodule FakeS3.Router do
          prefix: Map.get(params, "prefix") || "",
          delimiter: empty_to_nil(Map.get(params, "delimiter")),
          token: empty_to_nil(Map.get(params, "continuation-token")),
-         marker: empty_to_nil(Map.get(params, "marker")),
+         # ListObjectVersions spells the same cursor "key-marker".
+         marker: empty_to_nil(Map.get(params, "marker") || Map.get(params, "key-marker")),
          start_after: empty_to_nil(Map.get(params, "start-after")),
          encoding_type: encoding_type(Map.get(params, "encoding-type")),
          max_keys: max_keys

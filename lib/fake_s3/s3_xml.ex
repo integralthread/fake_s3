@@ -71,6 +71,36 @@ defmodule FakeS3.S3XML do
     |> generate()
   end
 
+  # FakeS3 does not store versions, so every key is reported as a single latest
+  # version with the "null" version id S3 uses for unversioned buckets.
+  def list_object_versions(bucket, params, contents, common_prefixes, is_truncated, next_marker) do
+    enc = params.encoding_type
+
+    elements =
+      [
+        element(:Name, bucket),
+        element(:Prefix, encode(params.prefix, enc)),
+        element(:KeyMarker, encode(params.marker || "", enc)),
+        element(:VersionIdMarker, ""),
+        element(:MaxKeys, Integer.to_string(params.max_keys)),
+        element(:Delimiter, encode(params.delimiter || "", enc)),
+        element(:IsTruncated, boolean(is_truncated))
+      ]
+      |> maybe_append(is_truncated && next_marker, &element(:NextKeyMarker, encode(&1, enc)))
+      |> maybe_append(is_truncated && next_marker, fn _ ->
+        element(:NextVersionIdMarker, "null")
+      end)
+      |> maybe_append(enc, &element(:EncodingType, &1))
+
+    elements =
+      elements ++
+        Enum.map(contents, &version_xml(&1, enc)) ++
+        Enum.map(common_prefixes, &common_prefix_xml(&1, enc))
+
+    document(:ListVersionsResult, %{xmlns: @xmlns}, elements)
+    |> generate()
+  end
+
   def error(code, message, resource, request_id) do
     document(:Error, [
       element(:Code, code),
@@ -213,6 +243,19 @@ defmodule FakeS3.S3XML do
       element(:ETag, object.etag),
       element(:Size, Integer.to_string(object.size)),
       element(:StorageClass, "STANDARD")
+    ])
+  end
+
+  defp version_xml(object, enc) do
+    element(:Version, [
+      element(:Key, encode(object.key, enc)),
+      element(:VersionId, "null"),
+      element(:IsLatest, "true"),
+      element(:LastModified, Time.to_xml(object.last_modified)),
+      element(:ETag, object.etag),
+      element(:Size, Integer.to_string(object.size)),
+      element(:StorageClass, "STANDARD"),
+      element(:Owner, [element(:ID, "fake"), element(:DisplayName, "fake")])
     ])
   end
 

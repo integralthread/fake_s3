@@ -28,3 +28,6 @@ fake_s3-*.tar
 # Default FAKES3_DATA_DIR.
 /.fakes3/
 
+# Third-party test suites cloned by "mise run bootstrap".
+/vendor/
+

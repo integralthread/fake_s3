@@ -52,8 +52,8 @@ Objects: PutObject, GetObject (incl. `Range`), HeadObject, DeleteObject,
 DeleteObjects (bulk), CopyObject (with `x-amz-metadata-directive`).
 
 Buckets: CreateBucket, ListBuckets, HeadBucket, DeleteBucket,
-ListObjects (v1), ListObjectsV2, GetBucketLocation, GetBucketVersioning,
-GetBucketAcl.
+ListObjects (v1), ListObjectsV2, ListObjectVersions, GetBucketLocation,
+GetBucketVersioning, GetBucketAcl.
 
 Multipart: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
 AbortMultipartUpload, ListParts, ListMultipartUploads.
@@ -76,6 +76,8 @@ These are deliberate, and are the things most likely to surprise you:
   last to be at least 5 MB. That is not enforced, so tests can use tiny parts.
 - **No versioning, lifecycle, ACL enforcement, or encryption.** The ACL and
   versioning endpoints return static stub documents so SDK calls succeed.
+  ListObjectVersions reports every key once, as the latest version with the
+  `null` version id S3 uses for unversioned buckets.
 - **`NextMarker`/`NextContinuationToken` are real keys**, not opaque cursors.
   They resume correctly but do not match S3's values byte for byte.
 - **Signature verification accepts two query canonicalisations.** `a+b` in a
@@ -141,6 +143,34 @@ mix run --no-halt &
 ```sh
 mix test
 ```
+
+## ceph/s3-tests
+
+[ceph/s3-tests](https://github.com/ceph/s3-tests) is a third-party S3
+compatibility suite. `mise run bootstrap` clones it into `vendor/s3-tests`
+(gitignored) and builds a Python venv for it:
+
+```sh
+mise run bootstrap      # once
+mise run server         # in another shell
+mise run s3-tests
+```
+
+`s3tests.conf` at the repo root points the suite at `127.0.0.1:4569`, and
+`mise.toml` exports it as `S3TEST_CONF`. The suite expects several distinct
+users; FakeS3's default `noauth` mode accepts any key, so they all share one
+store.
+
+Pass pytest arguments after `--`:
+
+```sh
+mise run s3-tests -- s3tests/functional/test_s3.py::test_bucket_list_empty
+mise run s3-tests -- s3tests/functional/test_s3.py -m 'not fails_on_aws'
+```
+
+Most of the suite exercises features FakeS3 does not implement (versioning,
+lifecycle, encryption, IAM, tagging), so a large number of failures is
+expected. Nothing here is wired into `mise run check`.
 
 ## Debug endpoints
 

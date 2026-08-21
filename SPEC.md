@@ -306,6 +306,8 @@ v1 and v2 are both implemented. Beyond the original scope:
 
 	•	ListObjects v1, DeleteObjects (bulk), GetBucketLocation/Versioning/Acl —
 	  needed because the AWS CLI and boto3 call them during ordinary operations.
+	•	ListObjectVersions — the ceph/s3-tests suite empties buckets with it in
+	  teardown. Unversioned, so every key is reported once at version "null".
 	•	aws-chunked request body decoding — SDKs frame bodies this way whenever
 	  checksums are enabled; storing the framing corrupts the object.
 	•	Presigned URL (query string) authentication with expiry checking.

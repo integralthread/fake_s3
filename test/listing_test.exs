@@ -196,6 +196,36 @@ defmodule FakeS3.ListingTest do
       assert resp.body =~ "<Code>NotImplemented</Code>"
     end
 
+    test "?versions lists every key at version null", %{req: req, bucket: bucket} do
+      for name <- ~w(a.txt b.txt), do: Req.put!(req, url: "s3://#{bucket}/#{name}", body: "x")
+
+      resp = list(req, bucket, %{"versions" => ""})
+
+      assert resp.status == 200
+      assert resp.body =~ "<ListVersionsResult"
+      assert xml_values(resp.body, "Key") == ~w(a.txt b.txt)
+      assert xml_values(resp.body, "VersionId") == ~w(null null)
+      assert xml_values(resp.body, "IsLatest") == ~w(true true)
+    end
+
+    test "?versions paginates with key-marker", %{req: req, bucket: bucket} do
+      for name <- ~w(a.txt b.txt c.txt),
+          do: Req.put!(req, url: "s3://#{bucket}/#{name}", body: "x")
+
+      first = list(req, bucket, %{"versions" => "", "max-keys" => "2"})
+
+      assert first.status == 200
+      assert first.body =~ "<IsTruncated>true</IsTruncated>"
+      assert xml_values(first.body, "Key") == ~w(a.txt b.txt)
+
+      [marker] = xml_values(first.body, "NextKeyMarker")
+      second = list(req, bucket, %{"versions" => "", "key-marker" => marker})
+
+      assert second.status == 200
+      assert second.body =~ "<IsTruncated>false</IsTruncated>"
+      assert xml_values(second.body, "Key") == ~w(c.txt)
+    end
+
     test "listing a missing bucket 404s", %{endpoint: endpoint} do
       resp = list(s3_req(endpoint), "no-such-bucket-xyz", %{"list-type" => "2"})
 

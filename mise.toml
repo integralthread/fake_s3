@@ -1,0 +1,107 @@
+[tools]
+erlang = "28.3"
+elixir = "1.19.4-otp-28"
+
+# Used by test_aws_cli.sh, which drives the server with a real S3 client.
+awscli = "2.36.28"
+shellcheck = "0.11.0"
+shfmt = "3.13.1"
+
+# Used to run the vendored ceph/s3-tests suite (boto3 + pytest).
+python = "3.12"
+uv = "0.11.16"
+
+[bootstrap.repos]
+"vendor/s3-tests" = { url = "git@github.com:ceph/s3-tests.git", ref = "master" }
+
+# bootstrap.repos only clones; the suite is Python/boto3 and needs its own venv.
+[bootstrap.hooks]
+post-repos = "mise run s3-tests-install"
+
+[env]
+# Where `mise bootstrap` clones third-party test suites.
+VENDOR_DIR = "{{config_root}}/vendor"
+S3TEST_CONF = "{{config_root}}/s3tests.conf"
+
+[tasks.deps]
+description = "Fetch and compile dependencies"
+run = "mix deps.get"
+
+[tasks.compile]
+description = "Compile with warnings as errors"
+depends = ["deps"]
+run = "mix compile --warnings-as-errors"
+
+[tasks.server]
+description = "Run the server (FAKES3_PORT, FAKES3_HOST, FAKES3_DATA_DIR)"
+depends = ["deps"]
+run = "mix run --no-halt"
+
+[tasks.test]
+description = "Run the test suite"
+depends = ["deps"]
+run = "mix test"
+
+[tasks.format]
+description = "Format Elixir sources and shell scripts"
+run = ["mix format", "shfmt -w -i 4 test_aws_cli.sh"]
+
+[tasks.lint]
+description = "Check formatting and lint the shell test script"
+run = [
+  "mix format --check-formatted",
+  "shfmt -d -i 4 test_aws_cli.sh",
+  "shellcheck test_aws_cli.sh",
+]
+
+[tasks.test-aws-cli]
+description = "Run the AWS CLI contract script against a running server"
+run = "./test_aws_cli.sh"
+
+[tasks.check]
+description = "Everything CI should run"
+depends = ["lint", "compile", "test"]
+
+[tasks.s3-tests-install]
+description = "Build the venv for the cloned ceph/s3-tests checkout"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="$VENDOR_DIR/s3-tests"
+if [ ! -d "$repo" ]; then
+  echo "$repo is missing; run 'mise bootstrap' to clone it" >&2
+  exit 1
+fi
+
+# Kept out of anything global: these deps are unrelated to our mix deps.
+uv venv --python 3.12 "$repo/.venv"
+VIRTUAL_ENV="$repo/.venv" uv pip install -r "$repo/requirements.txt" -e "$repo"
+
+echo "==> ready; run 'mise run server' then 'mise run s3-tests'"
+"""
+
+[tasks.s3-tests]
+description = "Run ceph/s3-tests against a running FakeS3 server"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Not `dir = ...` on the task: mise fails to cd before this guard can explain why.
+repo="$VENDOR_DIR/s3-tests"
+if [ ! -x "$repo/.venv/bin/pytest" ]; then
+  echo "vendor/s3-tests is not set up; run 'mise bootstrap' first" >&2
+  exit 1
+fi
+
+# pytest.ini (which registers the suite's markers) lives at the repo root.
+cd "$repo"
+
+# Default to the main S3 functional file. Anything passed after `--` replaces
+# it, e.g. `mise run s3-tests -- s3tests/functional/test_s3.py::test_bucket_list_empty`.
+if [ "$#" -eq 0 ]; then
+  set -- s3tests/functional/test_s3.py
+fi
+
+exec .venv/bin/pytest "$@"
+"""
