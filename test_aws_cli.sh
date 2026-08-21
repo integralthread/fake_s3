@@ -21,7 +21,10 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 pass() { echo -e "${GREEN}PASS${NC}: $1"; }
-fail() { echo -e "${RED}FAIL${NC}: $1"; exit 1; }
+fail() {
+    echo -e "${RED}FAIL${NC}: $1"
+    exit 1
+}
 info() { echo -e "${YELLOW}TEST${NC}: $1"; }
 
 aws_s3() {
@@ -52,7 +55,7 @@ echo
 
 # Check server is running
 info "Checking server health..."
-if curl -sf "$ENDPOINT/__health" > /dev/null; then
+if curl -sf "$ENDPOINT/__health" >/dev/null; then
     pass "Server is healthy"
 else
     fail "Server not responding at $ENDPOINT"
@@ -69,7 +72,11 @@ pass "Created bucket $BUCKET"
 
 # List buckets
 info "Listing buckets..."
-aws_s3 ls | grep -q "$BUCKET" && pass "Bucket appears in list" || fail "Bucket not in list"
+if aws_s3 ls | grep -q "$BUCKET"; then
+    pass "Bucket appears in list"
+else
+    fail "Bucket not in list"
+fi
 
 # Head bucket (check exists)
 info "Head bucket..."
@@ -83,7 +90,7 @@ echo "--- OBJECT CRUD OPERATIONS ---"
 echo
 
 # Create test file
-echo "Hello, FakeS3!" > /tmp/fakes3_test_hello.txt
+echo "Hello, FakeS3!" >/tmp/fakes3_test_hello.txt
 
 # Put object
 info "Putting object..."
@@ -110,7 +117,11 @@ fi
 
 # List objects
 info "Listing objects..."
-aws_s3 ls "s3://$BUCKET/" | grep -q "hello.txt" && pass "Object appears in list" || fail "Object not in list"
+if aws_s3 ls "s3://$BUCKET/" | grep -q "hello.txt"; then
+    pass "Object appears in list"
+else
+    fail "Object not in list"
+fi
 
 echo
 echo "--- METADATA OPERATIONS ---"
@@ -130,9 +141,21 @@ pass "Put object with metadata"
 # Get object and check metadata
 info "Checking object metadata..."
 META_OUT=$(aws_s3api head-object --bucket "$BUCKET" --key "meta.txt")
-echo "$META_OUT" | grep -q "text/plain" && pass "Content-Type preserved" || fail "Content-Type not preserved"
-echo "$META_OUT" | grep -q "max-age=3600" && pass "Cache-Control preserved" || fail "Cache-Control not preserved"
-echo "$META_OUT" | grep -q "custom-value" && pass "Custom metadata preserved" || fail "Custom metadata not preserved"
+if echo "$META_OUT" | grep -q "text/plain"; then
+    pass "Content-Type preserved"
+else
+    fail "Content-Type not preserved"
+fi
+if echo "$META_OUT" | grep -q "max-age=3600"; then
+    pass "Cache-Control preserved"
+else
+    fail "Cache-Control not preserved"
+fi
+if echo "$META_OUT" | grep -q "custom-value"; then
+    pass "Custom metadata preserved"
+else
+    fail "Custom metadata not preserved"
+fi
 
 echo
 echo "--- LIST OBJECTS V2 WITH PREFIX/DELIMITER ---"
@@ -159,8 +182,16 @@ fi
 # List with delimiter (should show common prefixes)
 info "Listing with delimiter..."
 RESULT=$(aws_s3api list-objects-v2 --bucket "$BUCKET" --prefix "logs/" --delimiter "/")
-echo "$RESULT" | grep -q "CommonPrefixes" && pass "Delimiter grouping works" || fail "Delimiter grouping failed"
-echo "$RESULT" | grep -q "logs/2024/" && pass "Common prefix logs/2024/ found" || fail "Common prefix not found"
+if echo "$RESULT" | grep -q "CommonPrefixes"; then
+    pass "Delimiter grouping works"
+else
+    fail "Delimiter grouping failed"
+fi
+if echo "$RESULT" | grep -q "logs/2024/"; then
+    pass "Common prefix logs/2024/ found"
+else
+    fail "Common prefix not found"
+fi
 
 # Pagination test
 info "Testing pagination..."
@@ -169,7 +200,12 @@ if echo "$PAGE1" | grep -q "NextToken"; then
     pass "Pagination NextToken returned"
     NEXT_TOKEN=$(echo "$PAGE1" | grep -o '"NextToken": "[^"]*"' | cut -d'"' -f4)
     PAGE2=$(aws_s3api list-objects-v2 --bucket "$BUCKET" --starting-token "$NEXT_TOKEN")
-    pass "Pagination continuation works"
+    # The second page was fetched but never inspected, so this always passed.
+    if echo "$PAGE2" | grep -q '"Key":'; then
+        pass "Pagination continuation returned more keys"
+    else
+        fail "Pagination continuation returned no keys"
+    fi
 else
     info "Note: Pagination token not returned (may have fewer objects than max-items)"
 fi
@@ -219,15 +255,15 @@ echo "--- RANGE REQUESTS ---"
 echo
 
 # Create larger file for range tests
-echo "0123456789ABCDEFGHIJ" > /tmp/fakes3_test_range.txt
+echo "0123456789ABCDEFGHIJ" >/tmp/fakes3_test_range.txt
 aws_s3 cp /tmp/fakes3_test_range.txt "s3://$BUCKET/range.txt"
 
 info "Testing range request (first 5 bytes)..."
-RANGE_RESULT=$(aws_s3api get-object \
+aws_s3api get-object \
     --bucket "$BUCKET" \
     --key "range.txt" \
     --range "bytes=0-4" \
-    /tmp/fakes3_test_range_out.txt 2>&1)
+    /tmp/fakes3_test_range_out.txt >/dev/null
 if [ "$(cat /tmp/fakes3_test_range_out.txt)" = "01234" ]; then
     pass "Range request bytes=0-4 returned '01234'"
 else
@@ -239,7 +275,7 @@ aws_s3api get-object \
     --bucket "$BUCKET" \
     --key "range.txt" \
     --range "bytes=10-14" \
-    /tmp/fakes3_test_range_out2.txt > /dev/null
+    /tmp/fakes3_test_range_out2.txt >/dev/null
 if [ "$(cat /tmp/fakes3_test_range_out2.txt)" = "ABCDE" ]; then
     pass "Range request bytes=10-14 returned 'ABCDE'"
 else
@@ -315,7 +351,11 @@ fi
 
 info "Checking reported size..."
 BIG_LEN=$(aws_s3api head-object --bucket "$BUCKET" --key "big.bin" --query 'ContentLength' --output text)
-[ "$BIG_LEN" = "20971520" ] && pass "HEAD reports $BIG_LEN bytes" || fail "HEAD reported $BIG_LEN"
+if [ "$BIG_LEN" = "20971520" ]; then
+    pass "HEAD reports $BIG_LEN bytes"
+else
+    fail "HEAD reported $BIG_LEN"
+fi
 
 info "Aborting an upload..."
 UPLOAD_ID=$(aws_s3api create-multipart-upload --bucket "$BUCKET" --key "aborted.bin" --query 'UploadId' --output text)
@@ -327,11 +367,11 @@ echo "--- LIST VARIANTS ---"
 echo
 
 info "ListObjects v1..."
-aws_s3api list-objects --bucket "$BUCKET" --max-keys 2 > /dev/null
+aws_s3api list-objects --bucket "$BUCKET" --max-keys 2 >/dev/null
 pass "list-objects (v1) succeeded"
 
 info "GetBucketLocation..."
-aws_s3api get-bucket-location --bucket "$BUCKET" > /dev/null
+aws_s3api get-bucket-location --bucket "$BUCKET" >/dev/null
 pass "get-bucket-location succeeded"
 
 echo
@@ -340,8 +380,12 @@ echo
 
 info "Ranged GET..."
 echo -n "hello world" | aws_s3 cp - "s3://$BUCKET/range.txt"
-RANGE_OUT=$(aws_s3api get-object --bucket "$BUCKET" --key "range.txt" --range "bytes=0-4" /tmp/fakes3_test_range.txt > /dev/null && cat /tmp/fakes3_test_range.txt)
-[ "$RANGE_OUT" = "hello" ] && pass "Range returned '$RANGE_OUT'" || fail "Range returned '$RANGE_OUT'"
+RANGE_OUT=$(aws_s3api get-object --bucket "$BUCKET" --key "range.txt" --range "bytes=0-4" /tmp/fakes3_test_range.txt >/dev/null && cat /tmp/fakes3_test_range.txt)
+if [ "$RANGE_OUT" = "hello" ]; then
+    pass "Range returned '$RANGE_OUT'"
+else
+    fail "Range returned '$RANGE_OUT'"
+fi
 
 info "Unsatisfiable range returns 416..."
 if aws_s3api get-object --bucket "$BUCKET" --key "range.txt" --range "bytes=9999-99999" /tmp/fakes3_test_range2.txt 2>&1 | grep -qi "416\|InvalidRange\|Requested Range"; then
@@ -360,7 +404,11 @@ echo "y" | aws_s3 cp - "s3://$BUCKET/bulk2.txt"
 DELETED=$(aws_s3api delete-objects --bucket "$BUCKET" \
     --delete 'Objects=[{Key=bulk1.txt},{Key=bulk2.txt}]' \
     --query 'length(Deleted)' --output text)
-[ "$DELETED" = "2" ] && pass "Bulk deleted $DELETED objects" || fail "Bulk delete reported $DELETED"
+if [ "$DELETED" = "2" ]; then
+    pass "Bulk deleted $DELETED objects"
+else
+    fail "Bulk delete reported $DELETED"
+fi
 
 echo
 echo "--- DELETE OPERATIONS ---"

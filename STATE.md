@@ -34,7 +34,9 @@ keys could never be removed. Text extraction now preserves whitespace;
 
 ## Verified
 
-- `mix test` — 107 tests, 0 failures.
+- `mix test` — 107 tests, 0 failures (on the updated deps).
+- `mise run check` — lint + compile + test, all green.
+- `./test_aws_cli.sh` — passes against a live server, exit 0.
 - `mise bootstrap` — works from a clean tree (`rm -rf vendor` then bootstrap).
 - Full `test_s3.py` run, all 838 collected tests execute:
 
@@ -94,13 +96,26 @@ After that, the remaining failure tail is genuine feature gaps: `KeyError`s for
 
 ## Known loose ends
 
-- `mise run lint` fails on pre-existing issues in `test_aws_cli.sh`: 5
-  shellcheck findings (SC2034 at lines 171/226, SC2015 at 318/344/363) and an
-  `shfmt -i 4` diff. So `mise run check` fails out of the box. Untouched — the
-  script's behavior was not in scope.
-- `mix deps.get` reports a security advisory on `xml_builder`
-  (EEF-CVE-2026-48590, LOW): element and attribute names are injected verbatim
-  into XML output. Worth a look since this project builds S3 XML from
-  user-supplied bucket and key names — and see suspicion #1 above, which may be
-  the same underlying escaping gap.
+- `mix deps.get` still reports advisories, now on **cowlib 2.19.0** (a
+  transitive dep of cowboy): EEF-CVE-2026-43969 (LOW, cookie header injection),
+  EEF-CVE-2026-43971 and EEF-CVE-2026-43966 (MEDIUM, Link-header smuggling and
+  response splitting). All three are in header encoders FakeS3 does not call
+  directly, so they look like exposure rather than an active bug — but they are
+  unresolved and bounded only by cowboy's own release cadence.
 - s3-tests is deliberately not wired into `mise run check`.
+
+## Resolved
+
+- **`mise run lint` is clean and `mise run check` passes end to end.**
+  `test_aws_cli.sh` had 9 shellcheck findings plus an `shfmt -i 4` diff. Two
+  were real bugs, not style: `PAGE2` was fetched and never inspected, so
+  "Pagination continuation works" passed unconditionally — it now asserts the
+  second page actually contains keys; and `RANGE_RESULT` existed only to
+  swallow stdout, replaced with an explicit redirect. The other seven were
+  `A && B || C` chains converted to the `if/then/else` the file already uses
+  everywhere else. Verified by running the script against a live server: all
+  tests pass, exit 0, and the strengthened pagination branch is genuinely
+  exercised rather than skipped.
+- **`xml_builder` advisory (EEF-CVE-2026-48590) is gone** as of the dep update
+  to 2.4.1. Note this was never the cause of the whitespace bug above — that
+  was FakeS3's own request parsing, not xml_builder's output escaping.
