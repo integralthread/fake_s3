@@ -3,6 +3,7 @@ defmodule FakeS3.Storage do
 
   alias FakeS3.Config
   alias FakeS3.Key
+  alias FakeS3.Time
 
   def bucket_dir(bucket) do
     Path.join([Config.data_dir(), "buckets", bucket])
@@ -68,13 +69,20 @@ defmodule FakeS3.Storage do
     end
   end
 
-  def bucket_empty?(bucket) do
-    dir = objects_dir(bucket)
+  @doc """
+  True when nothing at all remains, including old versions and delete markers.
 
-    case File.dir?(dir) do
-      false -> true
-      true -> not any_file?(dir)
-    end
+  S3 refuses to delete a bucket that still holds non-current versions, and a
+  delete marker is metadata with no content file, so checking objects/ alone
+  would call a bucket empty while its version history was still on disk.
+  """
+  def bucket_empty?(bucket) do
+    Enum.all?([objects_dir(bucket), meta_dir(bucket), versions_meta_dir(bucket)], fn dir ->
+      case File.dir?(dir) do
+        false -> true
+        true -> not any_file?(dir)
+      end
+    end)
   end
 
   def list_buckets do
@@ -101,7 +109,11 @@ defmodule FakeS3.Storage do
       {:ok, body} ->
         case Jason.decode(body) do
           {:ok, meta} ->
-            %{name: meta["name"], created_at: meta["created_at"]}
+            %{
+              name: meta["name"],
+              created_at: meta["created_at"],
+              versioning: meta["versioning"]
+            }
 
           _ ->
             nil
@@ -109,6 +121,41 @@ defmodule FakeS3.Storage do
 
       _ ->
         nil
+    end
+  end
+
+  @doc """
+  The bucket's versioning state: `nil` (never configured), `"Enabled"` or
+  `"Suspended"`.
+
+  S3 has no way back to the unconfigured state once versioning has been
+  enabled, which is why `nil` and `"Suspended"` are distinct: `nil` returns an
+  empty `VersioningConfiguration`, `"Suspended"` returns an explicit status.
+  """
+  def versioning(bucket) do
+    case bucket_meta(bucket) do
+      %{versioning: status} -> status
+      _ -> nil
+    end
+  end
+
+  def versioning_enabled?(bucket), do: versioning(bucket) == "Enabled"
+
+  @doc "True once versioning has ever been turned on, i.e. old versions may exist."
+  def versioned?(bucket), do: versioning(bucket) in ["Enabled", "Suspended"]
+
+  def put_versioning(bucket, status) when status in ["Enabled", "Suspended"] do
+    path = bucket_meta_path(bucket)
+
+    case File.read(path) do
+      {:ok, body} ->
+        case Jason.decode(body) do
+          {:ok, meta} -> write_json_atomic(path, Map.put(meta, "versioning", status))
+          _ -> {:error, :bucket_meta_unreadable}
+        end
+
+      _ ->
+        {:error, :bucket_meta_unreadable}
     end
   end
 
@@ -364,6 +411,284 @@ defmodule FakeS3.Storage do
     |> Map.put("content_type", replacement.content_type)
     |> Map.put("headers", replacement.headers)
     |> Map.put("user_metadata", replacement.user_metadata)
+  end
+
+  ## Versioning
+  #
+  # The current version of a key stays exactly where an unversioned object
+  # lives: content at objects/<key>, metadata at meta/<key>.json. Only
+  # superseded versions move into the parallel versions/ trees. That keeps
+  # every unversioned code path — reads, listings, bucket_empty? — untouched,
+  # and means enabling versioning on a bucket does not rewrite what is already
+  # stored.
+  #
+  # A delete marker is metadata with no content file, so an ordinary read
+  # naturally reports not_found.
+
+  def versions_dir(bucket), do: Path.join([bucket_dir(bucket), "versions"])
+  def versions_meta_dir(bucket), do: Path.join([bucket_dir(bucket), "versions_meta"])
+
+  # Versions of key "a/b" live under "versions/a/b.d/". The suffix stops the
+  # directory holding versions of key "a" from colliding with the directory
+  # that has to contain key "a/b".
+  defp version_segments(key) do
+    List.update_at(Key.key_path(key), -1, &(&1 <> ".d"))
+  end
+
+  def version_path(bucket, key, version_id) do
+    Path.join([versions_dir(bucket) | version_segments(key)] ++ [version_id])
+  end
+
+  def version_meta_path(bucket, key, version_id) do
+    Path.join([versions_meta_dir(bucket) | version_segments(key)] ++ [version_id <> ".json"])
+  end
+
+  @doc """
+  A fresh version id.
+
+  Lexicographically sortable so that ordering by id is ordering by creation
+  time, which is what "latest version" and the ListObjectVersions ordering
+  both rely on.
+  """
+  def new_version_id do
+    stamp =
+      System.os_time(:microsecond)
+      |> Integer.to_string()
+      |> String.pad_leading(20, "0")
+
+    stamp <> "-" <> unique_suffix()
+  end
+
+  def read_current_meta(bucket, key) do
+    case read_json(object_meta_path(bucket, key)) do
+      {:ok, meta} -> meta
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Moves the current version, if any, into the versions tree.
+
+  In the Suspended state S3 reuses the id "null" for every new version, so an
+  existing "null" version is discarded rather than archived — otherwise the
+  tree would accumulate several versions all claiming the same id.
+  """
+  def archive_current(bucket, key) do
+    case read_current_meta(bucket, key) do
+      nil ->
+        :ok
+
+      meta ->
+        version_id = meta["version_id"] || "null"
+        content_path = object_path(bucket, key)
+
+        if version_id == "null" do
+          File.rm(content_path)
+        else
+          target = version_path(bucket, key, version_id)
+          File.mkdir_p(Path.dirname(target))
+          File.mkdir_p(Path.dirname(version_meta_path(bucket, key, version_id)))
+
+          # A delete marker has metadata but no content to move.
+          if File.regular?(content_path), do: File.rename(content_path, target)
+          write_json_atomic(version_meta_path(bucket, key, version_id), meta)
+        end
+
+        File.rm(object_meta_path(bucket, key))
+        :ok
+    end
+  end
+
+  @doc "Every stored version of a key, current first, newest to oldest."
+  def list_versions(bucket, key) do
+    current =
+      case read_current_meta(bucket, key) do
+        nil -> []
+        meta -> [Map.put(meta, "is_latest", true)]
+      end
+
+    archived =
+      case File.ls(Path.join([versions_meta_dir(bucket) | version_segments(key)])) do
+        {:ok, entries} ->
+          entries
+          |> Enum.filter(&String.ends_with?(&1, ".json"))
+          |> Enum.map(&Path.join([versions_meta_dir(bucket) | version_segments(key)] ++ [&1]))
+          |> Enum.flat_map(fn path ->
+            case read_json(path) do
+              {:ok, meta} -> [Map.put(meta, "is_latest", false)]
+              _ -> []
+            end
+          end)
+
+        _ ->
+          []
+      end
+
+    current ++ Enum.sort_by(archived, &version_seq/1, :desc)
+  end
+
+  # Written at microsecond resolution precisely so that two versions created in
+  # the same second still order deterministically.
+  defp version_seq(meta), do: meta["version_seq"] || 0
+
+  @doc "Reads one specific version: the current one if its id matches, else an archived one."
+  def read_version(bucket, key, version_id) do
+    current = read_current_meta(bucket, key)
+
+    if current && (current["version_id"] || "null") == version_id do
+      read_stored(object_path(bucket, key), current)
+    else
+      case read_json(version_meta_path(bucket, key, version_id)) do
+        {:ok, meta} -> read_stored(version_path(bucket, key, version_id), meta)
+        _ -> {:error, :no_such_version}
+      end
+    end
+  end
+
+  defp read_stored(content_path, meta) do
+    if meta["delete_marker"] do
+      {:ok, %{content_path: nil, meta: meta, stat: nil, delete_marker: true}}
+    else
+      case File.stat(content_path) do
+        {:ok, %File.Stat{type: :regular} = stat} ->
+          {:ok, %{content_path: content_path, meta: meta, stat: stat, delete_marker: false}}
+
+        _ ->
+          {:error, :no_such_version}
+      end
+    end
+  end
+
+  @doc "Records a delete marker as the current version, archiving whatever it supersedes."
+  def put_delete_marker(bucket, key, version_id) do
+    archive_current(bucket, key)
+
+    meta = %{
+      "key" => key,
+      "bucket" => bucket,
+      "delete_marker" => true,
+      "version_id" => version_id,
+      "version_seq" => System.os_time(:microsecond),
+      "last_modified" => Time.now_iso()
+    }
+
+    write_json_atomic(object_meta_path(bucket, key), meta)
+  end
+
+  @doc """
+  Permanently removes one version.
+
+  Deleting the current version promotes the newest surviving one back into
+  place, so the key does not silently vanish while older versions remain.
+  """
+  def delete_version(bucket, key, version_id) do
+    current = read_current_meta(bucket, key)
+
+    if current && (current["version_id"] || "null") == version_id do
+      File.rm(object_path(bucket, key))
+      File.rm(object_meta_path(bucket, key))
+      promote_latest(bucket, key)
+      {:ok, current["delete_marker"] == true}
+    else
+      case read_json(version_meta_path(bucket, key, version_id)) do
+        {:ok, meta} ->
+          File.rm(version_path(bucket, key, version_id))
+          File.rm(version_meta_path(bucket, key, version_id))
+          prune_version_dirs(bucket, key)
+          {:ok, meta["delete_marker"] == true}
+
+        _ ->
+          {:error, :no_such_version}
+      end
+    end
+  end
+
+  defp promote_latest(bucket, key) do
+    case list_versions(bucket, key) do
+      [] ->
+        prune_object_dirs(bucket, key)
+        :ok
+
+      [newest | _] ->
+        version_id = newest["version_id"] || "null"
+        source = version_path(bucket, key, version_id)
+        target = object_path(bucket, key)
+
+        File.mkdir_p(Path.dirname(target))
+        File.mkdir_p(Path.dirname(object_meta_path(bucket, key)))
+
+        if File.regular?(source), do: File.rename(source, target)
+        write_json_atomic(object_meta_path(bucket, key), newest)
+        File.rm(version_meta_path(bucket, key, version_id))
+        prune_version_dirs(bucket, key)
+        :ok
+    end
+  end
+
+  defp prune_object_dirs(bucket, key) do
+    prune_empty_dirs(Path.dirname(object_path(bucket, key)), objects_dir(bucket))
+    prune_empty_dirs(Path.dirname(object_meta_path(bucket, key)), meta_dir(bucket))
+  end
+
+  defp prune_version_dirs(bucket, key) do
+    prune_empty_dirs(
+      Path.join([versions_dir(bucket) | version_segments(key)]),
+      versions_dir(bucket)
+    )
+
+    prune_empty_dirs(
+      Path.join([versions_meta_dir(bucket) | version_segments(key)]),
+      versions_meta_dir(bucket)
+    )
+  end
+
+  @doc "Every key that has any version, current or archived."
+  def list_versioned_keys(bucket) do
+    from_current = list_keys(bucket) ++ list_meta_keys(bucket)
+    from_archive = list_archived_keys(bucket)
+
+    (from_current ++ from_archive) |> Enum.uniq() |> Enum.sort()
+  end
+
+  # Delete markers exist only as metadata, so they are invisible to list_keys/1.
+  defp list_meta_keys(bucket) do
+    dir = meta_dir(bucket)
+
+    case File.dir?(dir) do
+      false ->
+        []
+
+      true ->
+        dir
+        |> walk_files()
+        |> Enum.map(&(&1 |> Path.relative_to(dir) |> Path.split() |> Enum.join("/")))
+        |> Enum.filter(&String.ends_with?(&1, ".json"))
+        |> Enum.map(&String.replace_suffix(&1, ".json", ""))
+    end
+  end
+
+  defp list_archived_keys(bucket) do
+    dir = versions_meta_dir(bucket)
+
+    case File.dir?(dir) do
+      false ->
+        []
+
+      true ->
+        dir
+        |> walk_files()
+        |> Enum.map(&(&1 |> Path.relative_to(dir) |> Path.split()))
+        |> Enum.flat_map(fn segments ->
+          # ".../<key last segment>.d/<version_id>.json" back to the key.
+          case Enum.split(segments, -2) do
+            {prefix, [dir_segment, _file]} ->
+              [Enum.join(prefix ++ [String.replace_suffix(dir_segment, ".d", "")], "/")]
+
+            _ ->
+              []
+          end
+        end)
+    end
   end
 
   def list_keys(bucket) do

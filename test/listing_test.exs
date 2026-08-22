@@ -168,10 +168,10 @@ defmodule FakeS3.ListingTest do
       {:ok, bucket: create_bucket!(endpoint), req: s3_req(endpoint)}
     end
 
-    test "?versioning is not treated as CreateBucket", %{req: req, bucket: bucket} do
+    test "?tagging is not treated as CreateBucket", %{req: req, bucket: bucket} do
       # Used to return 409 BucketAlreadyOwnedByYou, because every PUT on a
       # bucket path was routed to CreateBucket regardless of subresource.
-      resp = put_subresource(req, bucket, "versioning")
+      resp = put_subresource(req, bucket, "tagging")
 
       assert resp.status == 501
       assert resp.body =~ "<Code>NotImplemented</Code>"
@@ -182,6 +182,14 @@ defmodule FakeS3.ListingTest do
 
       assert resp.status == 501
       assert resp.body =~ "<Code>NotImplemented</Code>"
+    end
+
+    # ?versioning is handled rather than 501'd; see FakeS3.VersioningTest.
+    test "?versioning is dispatched to the versioning handler", %{req: req, bucket: bucket} do
+      resp = put_subresource(req, bucket, "versioning")
+
+      refute resp.status == 409
+      assert resp.body =~ "IllegalVersioningConfiguration"
     end
 
     test "a subresource on a missing bucket 404s", %{req: req} do

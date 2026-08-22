@@ -73,7 +73,15 @@ defmodule FakeS3.S3XML do
 
   # FakeS3 does not store versions, so every key is reported as a single latest
   # version with the "null" version id S3 uses for unversioned buckets.
-  def list_object_versions(bucket, params, contents, common_prefixes, is_truncated, next_marker) do
+  def list_object_versions(
+        bucket,
+        params,
+        versions,
+        delete_markers,
+        common_prefixes,
+        is_truncated,
+        next_marker
+      ) do
     enc = params.encoding_type
 
     elements =
@@ -94,7 +102,8 @@ defmodule FakeS3.S3XML do
 
     elements =
       elements ++
-        Enum.map(contents, &version_xml(&1, enc)) ++
+        Enum.map(versions, &version_xml(&1, enc)) ++
+        Enum.map(delete_markers, &delete_marker_xml(&1, enc)) ++
         Enum.map(common_prefixes, &common_prefix_xml(&1, enc))
 
     document(:ListVersionsResult, %{xmlns: @xmlns}, elements)
@@ -148,8 +157,17 @@ defmodule FakeS3.S3XML do
     |> generate()
   end
 
-  def versioning_configuration do
+  # An unconfigured bucket reports an empty document rather than a status, which
+  # is how clients tell "never enabled" from "enabled then suspended".
+  def versioning_configuration(status \\ nil)
+
+  def versioning_configuration(nil) do
     document(:VersioningConfiguration, %{xmlns: @xmlns}, [])
+    |> generate()
+  end
+
+  def versioning_configuration(status) do
+    document(:VersioningConfiguration, %{xmlns: @xmlns}, [element(:Status, status)])
     |> generate()
   end
 
@@ -249,12 +267,22 @@ defmodule FakeS3.S3XML do
   defp version_xml(object, enc) do
     element(:Version, [
       element(:Key, encode(object.key, enc)),
-      element(:VersionId, "null"),
-      element(:IsLatest, "true"),
+      element(:VersionId, object.version_id),
+      element(:IsLatest, boolean(object.is_latest)),
       element(:LastModified, Time.to_xml(object.last_modified)),
       element(:ETag, object.etag),
       element(:Size, Integer.to_string(object.size)),
       element(:StorageClass, "STANDARD"),
+      element(:Owner, [element(:ID, "fake"), element(:DisplayName, "fake")])
+    ])
+  end
+
+  defp delete_marker_xml(marker, enc) do
+    element(:DeleteMarker, [
+      element(:Key, encode(marker.key, enc)),
+      element(:VersionId, marker.version_id),
+      element(:IsLatest, boolean(marker.is_latest)),
+      element(:LastModified, Time.to_xml(marker.last_modified)),
       element(:Owner, [element(:ID, "fake"), element(:DisplayName, "fake")])
     ])
   end

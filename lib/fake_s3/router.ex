@@ -174,8 +174,7 @@ defmodule FakeS3.Router do
          {:ok, key} <- normalize_key(key) do
       case conn.query_params["uploadId"] do
         nil ->
-          Storage.delete_object(bucket, key)
-          send_resp(conn, 204, "")
+          handle_delete_object(conn, bucket, key)
 
         upload_id ->
           case Multipart.abort(bucket, upload_id) do
@@ -212,13 +211,29 @@ defmodule FakeS3.Router do
     if Enum.any?(@bucket_put_subresources, &Map.has_key?(conn.query_params, &1)) do
       with :ok <- validate_bucket(bucket),
            true <- Storage.bucket_exists?(bucket) do
-        s3_error(conn, :not_implemented, "/#{bucket}")
+        if Map.has_key?(conn.query_params, "versioning") do
+          handle_put_versioning(conn, bucket)
+        else
+          s3_error(conn, :not_implemented, "/#{bucket}")
+        end
       else
         false -> s3_error(conn, :no_such_bucket, "/#{bucket}")
         {:error, reason} -> s3_error(conn, reason, "/#{bucket}")
       end
     else
       handle_create_bucket(conn, bucket)
+    end
+  end
+
+  defp handle_put_versioning(conn, bucket) do
+    with {:ok, body, conn} <- read_control_body(conn),
+         status when status in ["Enabled", "Suspended"] <- XML.token(body, "Status"),
+         :ok <- Storage.put_versioning(bucket, status) do
+      send_resp(conn, 200, "")
+    else
+      {:error, reason} -> s3_error(conn, reason, "/#{bucket}")
+      # A missing or unrecognised <Status> is what S3 calls IllegalVersioningConfiguration.
+      _ -> s3_error(conn, :illegal_versioning_configuration, "/#{bucket}")
     end
   end
 
@@ -245,13 +260,13 @@ defmodule FakeS3.Router do
         xml_resp(conn, 200, S3XML.location_constraint(Config.region()))
 
       Map.has_key?(params, "versioning") ->
-        xml_resp(conn, 200, S3XML.versioning_configuration())
+        xml_resp(conn, 200, S3XML.versioning_configuration(Storage.versioning(bucket)))
 
       Map.has_key?(params, "acl") ->
         xml_resp(conn, 200, S3XML.access_control_policy())
 
       Map.has_key?(params, "versions") ->
-        handle_list_objects(conn, bucket, :versions)
+        handle_list_versions(conn, bucket)
 
       Map.has_key?(params, "uploads") ->
         xml_resp(
@@ -290,16 +305,24 @@ defmodule FakeS3.Router do
   defp handle_put_object(conn, bucket, key) do
     content_type = content_type(conn, key)
     {headers, user_meta} = Metadata.extract_headers(conn.req_headers)
+    version_id = new_version_id(bucket)
+
+    # The prior version has to move aside before the new content lands on top
+    # of it, since the current version keeps the unversioned path.
+    if version_id, do: Storage.archive_current(bucket, key)
 
     case Storage.put_object(bucket, key, &Body.stream_to_file(conn, &1)) do
       {:ok, meta_path, %{size: size, etag: etag}} ->
         meta =
-          Metadata.build_object_meta(bucket, key, size, etag, content_type, headers, user_meta)
+          bucket
+          |> Metadata.build_object_meta(key, size, etag, content_type, headers, user_meta)
+          |> put_version_fields(version_id)
 
         case Storage.write_json_atomic(meta_path, meta) do
           :ok ->
             conn
             |> put_resp_header("etag", etag)
+            |> maybe_version_header(version_id)
             |> send_resp(200, "")
 
           {:error, reason} ->
@@ -311,30 +334,140 @@ defmodule FakeS3.Router do
     end
   end
 
+  # nil for a bucket that has never had versioning enabled; "null" while
+  # suspended, which is the id S3 reuses for every write in that state.
+  defp new_version_id(bucket) do
+    case Storage.versioning(bucket) do
+      "Enabled" -> Storage.new_version_id()
+      "Suspended" -> "null"
+      _ -> nil
+    end
+  end
+
+  defp put_version_fields(meta, nil), do: meta
+
+  defp put_version_fields(meta, version_id) do
+    meta
+    |> Map.put(:version_id, version_id)
+    |> Map.put(:version_seq, System.os_time(:microsecond))
+  end
+
+  defp maybe_version_header(conn, nil), do: conn
+
+  defp maybe_version_header(conn, version_id),
+    do: put_resp_header(conn, "x-amz-version-id", version_id)
+
   defp handle_get_object(conn, bucket, key) do
-    case Storage.read_object(bucket, key) do
+    case resolve_version(conn, bucket, key) do
       {:ok, %{content_path: path, meta: meta, stat: stat}} ->
         conn
         |> apply_object_headers(meta)
+        |> apply_version_headers(meta)
         |> send_object(path, stat.size)
 
-      {:error, :not_found} ->
-        s3_error(conn, :no_such_key, "/#{bucket}/#{key}")
+      {:delete_marker, meta} ->
+        delete_marker_response(conn, bucket, key, meta)
+
+      {:error, reason} ->
+        s3_error(conn, reason, "/#{bucket}/#{key}")
     end
   end
 
   defp handle_head_object(conn, bucket, key) do
-    case Storage.read_object(bucket, key) do
+    case resolve_version(conn, bucket, key) do
       {:ok, %{content_path: path, meta: meta, stat: stat}} ->
         # send_resp/3 would let the adapter derive Content-Length from the
         # (empty) body and report 0. Going through send_file makes cowboy
         # derive it from the file while still omitting the body for HEAD.
         conn
         |> apply_object_headers(meta)
+        |> apply_version_headers(meta)
         |> send_file(200, path, 0, stat.size)
 
-      {:error, :not_found} ->
-        s3_error(conn, :no_such_key, "/#{bucket}/#{key}")
+      {:delete_marker, meta} ->
+        delete_marker_response(conn, bucket, key, meta)
+
+      {:error, reason} ->
+        s3_error(conn, reason, "/#{bucket}/#{key}")
+    end
+  end
+
+  defp handle_delete_object(conn, bucket, key) do
+    case {conn.query_params["versionId"], Storage.versioning(bucket)} do
+      # Deleting a named version really removes it, in any bucket state.
+      {version_id, _} when is_binary(version_id) ->
+        case Storage.delete_version(bucket, key, version_id) do
+          {:ok, marker?} ->
+            conn
+            |> put_resp_header("x-amz-version-id", version_id)
+            |> then(&if marker?, do: put_resp_header(&1, "x-amz-delete-marker", "true"), else: &1)
+            |> send_resp(204, "")
+
+          {:error, reason} ->
+            s3_error(conn, reason, "/#{bucket}/#{key}")
+        end
+
+      # Versioning on: the object is not removed, it is shadowed by a marker.
+      {nil, status} when status in ["Enabled", "Suspended"] ->
+        marker_id = if status == "Enabled", do: Storage.new_version_id(), else: "null"
+
+        case Storage.put_delete_marker(bucket, key, marker_id) do
+          :ok ->
+            conn
+            |> put_resp_header("x-amz-delete-marker", "true")
+            |> put_resp_header("x-amz-version-id", marker_id)
+            |> send_resp(204, "")
+
+          {:error, reason} ->
+            s3_error(conn, reason, "/#{bucket}/#{key}")
+        end
+
+      {nil, _} ->
+        Storage.delete_object(bucket, key)
+        send_resp(conn, 204, "")
+    end
+  end
+
+  defp resolve_version(conn, bucket, key) do
+    case conn.query_params["versionId"] do
+      nil ->
+        case Storage.read_object(bucket, key) do
+          {:ok, found} ->
+            {:ok, found}
+
+          {:error, :not_found} ->
+            # A current delete marker reads as absent, but S3 flags it so a
+            # client can tell "deleted" from "never existed".
+            case Storage.read_current_meta(bucket, key) do
+              %{"delete_marker" => true} = meta -> {:delete_marker, meta}
+              _ -> {:error, :no_such_key}
+            end
+        end
+
+      version_id ->
+        case Storage.read_version(bucket, key, version_id) do
+          {:ok, %{delete_marker: true, meta: meta}} -> {:delete_marker, meta}
+          {:ok, found} -> {:ok, found}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  # Addressing a delete marker directly is a 405 in S3; reaching one implicitly
+  # is a 404. Both carry x-amz-delete-marker so the client can distinguish it.
+  defp delete_marker_response(conn, bucket, key, meta) do
+    reason = if conn.query_params["versionId"], do: :method_not_allowed, else: :no_such_key
+
+    conn
+    |> put_resp_header("x-amz-delete-marker", "true")
+    |> apply_version_headers(meta)
+    |> s3_error(reason, "/#{bucket}/#{key}")
+  end
+
+  defp apply_version_headers(conn, meta) do
+    case meta["version_id"] do
+      nil -> conn
+      version_id -> put_resp_header(conn, "x-amz-version-id", version_id)
     end
   end
 
@@ -415,14 +548,22 @@ defmodule FakeS3.Router do
   defp handle_delete_objects(conn, bucket) do
     case read_control_body(conn) do
       {:ok, body, conn} ->
-        keys = XML.texts(body, "Key")
         quiet? = XML.token(body, "Quiet") == "true"
 
+        # Each <Object> is taken whole rather than gathering <Key> and
+        # <VersionId> into separate lists, so a key stays paired with the
+        # version it names. Dropping the pairing left every non-current
+        # version behind, and a bucket that could never be emptied.
         {deleted, errors} =
-          Enum.reduce(keys, {[], []}, fn key, {ok, failed} ->
-            case Key.safe_key(key) do
+          body
+          |> XML.extract_all("Object")
+          |> Enum.reduce({[], []}, fn object, {ok, failed} ->
+            key = XML.text(object, "Key")
+            version_id = XML.token(object, "VersionId")
+
+            case Key.safe_key(key || "") do
               {:ok, safe_key} ->
-                Storage.delete_object(bucket, safe_key)
+                delete_one(bucket, safe_key, version_id)
                 {[key | ok], failed}
 
               {:error, _} ->
@@ -436,6 +577,23 @@ defmodule FakeS3.Router do
       {:error, reason, conn} ->
         s3_error(conn, reason, "/#{bucket}")
     end
+  end
+
+  # Mirrors the single-object DELETE: a named version is really removed, an
+  # unnamed one is shadowed by a delete marker while versioning is on.
+  defp delete_one(bucket, key, nil) do
+    case Storage.versioning(bucket) do
+      status when status in ["Enabled", "Suspended"] ->
+        marker_id = if status == "Enabled", do: Storage.new_version_id(), else: "null"
+        Storage.put_delete_marker(bucket, key, marker_id)
+
+      _ ->
+        Storage.delete_object(bucket, key)
+    end
+  end
+
+  defp delete_one(bucket, key, version_id) do
+    Storage.delete_version(bucket, key, version_id)
   end
 
   ## Multipart
@@ -547,9 +705,6 @@ defmodule FakeS3.Router do
 
             :v1 ->
               S3XML.list_objects_v1(bucket, params, contents, prefixes, truncated?, next_key)
-
-            :versions ->
-              S3XML.list_object_versions(bucket, params, contents, prefixes, truncated?, next_key)
           end
 
         xml_resp(conn, 200, xml)
@@ -557,6 +712,72 @@ defmodule FakeS3.Router do
       {:error, reason} ->
         s3_error(conn, reason, "/#{bucket}")
     end
+  end
+
+  # Paginates by key rather than by key+version: every version of a key in the
+  # page is returned together. S3 can split a key's versions across pages via
+  # version-id-marker; nothing in practice depends on that, and doing it here
+  # would mean a second cursor through the version list.
+  defp handle_list_versions(conn, bucket) do
+    case list_params(conn.query_params) do
+      {:ok, params} ->
+        entries =
+          bucket
+          |> Storage.list_versioned_keys()
+          |> filter_and_group(params)
+
+        {page, truncated?, next_key} = paginate(entries, params.max_keys)
+        {versions, markers, prefixes} = split_version_entries(page, bucket)
+
+        xml =
+          S3XML.list_object_versions(
+            bucket,
+            params,
+            versions,
+            markers,
+            prefixes,
+            truncated?,
+            next_key
+          )
+
+        xml_resp(conn, 200, xml)
+
+      {:error, reason} ->
+        s3_error(conn, reason, "/#{bucket}")
+    end
+  end
+
+  defp split_version_entries(page, bucket) do
+    {versions, markers, prefixes} =
+      Enum.reduce(page, {[], [], []}, fn
+        {:key, key, _}, acc ->
+          Enum.reduce(Storage.list_versions(bucket, key), acc, fn meta,
+                                                                  {versions, markers, prefixes} ->
+            entry = version_entry(key, meta)
+
+            if meta["delete_marker"] do
+              {versions, [entry | markers], prefixes}
+            else
+              {[entry | versions], markers, prefixes}
+            end
+          end)
+
+        {:prefix, name, _}, {versions, markers, prefixes} ->
+          {versions, markers, [name | prefixes]}
+      end)
+
+    {Enum.reverse(versions), Enum.reverse(markers), Enum.reverse(prefixes)}
+  end
+
+  defp version_entry(key, meta) do
+    %{
+      key: key,
+      version_id: meta["version_id"] || "null",
+      is_latest: meta["is_latest"] == true,
+      last_modified: meta["last_modified"],
+      etag: meta["etag"],
+      size: meta["size"] || 0
+    }
   end
 
   defp list_params(params) do
@@ -906,6 +1127,17 @@ defmodule FakeS3.Router do
 
   defp error_info(:not_implemented),
     do: {501, "NotImplemented", "This operation is not implemented by FakeS3."}
+
+  defp error_info(:no_such_version),
+    do: {404, "NoSuchVersion", "The specified version does not exist."}
+
+  defp error_info(:method_not_allowed),
+    do: {405, "MethodNotAllowed", "The specified method is not allowed against this resource."}
+
+  defp error_info(:illegal_versioning_configuration),
+    do:
+      {400, "IllegalVersioningConfigurationException",
+       "The versioning configuration specified in the request is invalid."}
 
   defp error_info(_other),
     do: {500, "InternalError", "We encountered an internal error. Please try again."}

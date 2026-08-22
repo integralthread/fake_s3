@@ -39,7 +39,7 @@ change any test outcome.
 
 ## Verified
 
-- `mix test` — 112 tests, 0 failures (on the updated deps).
+- `mix test` — 133 tests, 0 failures (on the updated deps).
 - `mise run check` — lint + compile + test, all green.
 - `./test_aws_cli.sh` — passes against a live server, exit 0.
 - `mise bootstrap` — works from a clean tree (`rm -rf vendor` then bootstrap).
@@ -48,7 +48,8 @@ change any test outcome.
   | | passed | failed | skipped | errors |
   |---|---|---|---|---|
   | before whitespace fix | 122 | 143 | 1 | **573** |
-  | after | **199** | 545 | 94 | **0** |
+  | after whitespace fix | 199 | 545 | 94 | **0** |
+  | after versioning | **217** | 527 | 94 | **0** |
 
 Note: the ExUnit suite boots a listener on `FAKES3_PORT`, so `mix test` fails
 with `:eaddrinuse` while `mise run server` is up on the same port. Use
@@ -67,35 +68,89 @@ tests in `test/bulk_delete_test.exs`. Errors are now 0 and every test runs.
 
 ## Recommended next action
 
-**Implement bucket versioning**, starting with `PUT /:bucket?versioning` and
-the `VersionId` plumbing behind it.
+Versioning is done (below). The remaining failures are no longer one dominant
+cause — they are separate features, largest first:
 
-This is now the only way to move the number. See "PUT subresource routing"
-below for why the routing fix alone changed nothing: those tests fail in
-*setup*, and setup only succeeds if versioning genuinely works. The 501 they
-get now is honest, but it is still a failure.
+| area | failures | note |
+|---|---|---|
+| SSE / encryption (`test_copy_enc`, `test_copy_part_enc`) | ~68 | needs SSE-C/SSE-KMS headers; largest single block |
+| object lock | 29 | retention and legal hold |
+| POST object (browser form uploads) | 24 | a whole upload path FakeS3 lacks |
+| bucket logging | 14 | Ceph extension, low value here |
+| bucket/object ACL enforcement | ~12 | currently a static stub |
+| versioning leftovers | 34 | see below — mostly ACL/lock/copy interactions |
 
-Scope, roughly in dependency order:
+Recommend **SSE** next purely on volume, but note none of these is a cascade:
+each is worth roughly its own count, so the choice is about which capability
+FakeS3 actually wants rather than which unblocks the most. Given it is a
+dev/test fake, POST object uploads are probably more useful in practice than
+encryption stubs, and object lock least of all.
 
-1. `PUT /:bucket?versioning` stores Enabled/Suspended per bucket, and
-   `GET /:bucket?versioning` reflects it back (currently a static stub).
-2. Object writes to a versioned bucket keep prior versions and return
-   `x-amz-version-id`; this is the storage-layer change and the real work,
-   since objects are currently plain files at their key path.
-3. `GET`/`HEAD`/`DELETE` accept `?versionId=`, and DELETE without one inserts
-   a delete marker.
-4. `ListObjectVersions` reports real versions instead of today's single
-   `null` entry per key.
+The 34 remaining versioning failures are mostly interactions with features
+that do not exist yet (versioned ACLs, object lock on versions, versioned
+multipart copy), not gaps in the core versioning implemented here.
 
-Steps 1 and 4 are cheap; step 2 is a storage redesign and the point at which
-this stops being a small change. Worth deciding whether FakeS3 wants versioning
-at all before starting — "no versioning" is a legitimate, documented position
-for a dev/test fake, and the alternative is to accept that this tail of the
-suite stays red.
+## Versioning — implemented
 
-The rest of the failure tail is separate feature gaps: `KeyError`s for `ETag`
-(14), `ChecksumAlgorithm` (14), `PartsCount` (6), plus 6 `InvalidArgument` and
-4 `NoSuchUpload`.
+Enabling versioning does not rewrite anything already on disk: the current
+version of a key stays exactly where an unversioned object lives
+(`objects/<key>`, `meta/<key>.json`), and only superseded versions move into
+parallel `versions/` and `versions_meta/` trees. Every unversioned code path is
+untouched. Versions of key `a/b` live under `versions/a/b.d/<version_id>`; the
+`.d` suffix stops the directory holding versions of key `a` from colliding with
+the one that has to contain `a/b`.
+
+A delete marker is metadata with no content file, so an ordinary read reports
+not-found without any special casing.
+
+Covered: `PUT`/`GET ?versioning` (Enabled/Suspended, and "never configured"
+stays distinguishable from Suspended); versioned writes returning
+`x-amz-version-id`; `?versionId` on GET/HEAD/DELETE; delete markers, including
+405 when addressed directly and 404 with `x-amz-delete-marker` when hit
+implicitly; deleting the current version promoting the previous one back;
+Suspended reusing the `null` id and replacing rather than accumulating;
+`ListObjectVersions` with real versions, `IsLatest`, and `DeleteMarker`
+elements; and `bucket_empty?` accounting for history so DeleteBucket cannot
+orphan versions.
+
+Version ids are `<zero-padded-microseconds>-<random>`, so lexicographic order
+is creation order. 20 tests in `test/versioning_test.exs`.
+
+Two deliberate simplifications:
+
+- `ListObjectVersions` paginates by key, not by key+version, so every version
+  of a key in a page is returned together. S3 can split a key's versions across
+  pages via `version-id-marker`; that would need a second cursor and nothing
+  observed here depends on it.
+- Version and DeleteMarker elements are emitted grouped rather than interleaved
+  in key order. Clients sort them into separate lists regardless.
+
+### What it bought
+
+| | passed | failed | skipped | errors |
+|---|---|---|---|---|
+| before versioning | 199 | 545 | 94 | 0 |
+| after | **217** | 527 | 94 | 0 |
+
++18 tests, zero regressions (`PASSED` sets diffed either side). The 18 are the
+core versioning suite: `test_versioning_obj_create_read_remove`,
+`test_delete_marker_versioned`, `test_versioning_obj_suspend_versions`,
+`test_versioning_multi_object_delete`, and similar.
+
+Worth saying plainly: the previous STATE.md called versioning "the only way to
+move the number", which implied a large payoff. It moved it by 18. The estimate
+was wrong — most of the tests that *mention* versioning fail on some other
+missing feature they combine it with.
+
+### A regression this caught
+
+The first full run after versioning went to **667 errors** — worse than any
+point in this work. Cause: bulk delete gathered `<Key>` and `<VersionId>` into
+two separate flat lists, losing the pairing, so it ignored versions entirely.
+`nuke_bucket` empties a versioned bucket exactly that way, so no versioned
+bucket could ever be deleted, and the old `BucketNotEmpty` cascade came back.
+Fixed by parsing each `<Object>` element whole. Regression tests cover both the
+versioned bulk delete and the marker-inserting form.
 
 ## PUT subresource routing — fixed, and it moved nothing
 

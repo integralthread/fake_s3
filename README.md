@@ -49,11 +49,12 @@ Invalid numeric values are logged and ignored rather than crashing startup.
 ## Supported operations
 
 Objects: PutObject, GetObject (incl. `Range`), HeadObject, DeleteObject,
-DeleteObjects (bulk), CopyObject (with `x-amz-metadata-directive`).
+DeleteObjects (bulk), CopyObject (with `x-amz-metadata-directive`). GET, HEAD
+and DELETE accept `?versionId=`.
 
 Buckets: CreateBucket, ListBuckets, HeadBucket, DeleteBucket,
 ListObjects (v1), ListObjectsV2, ListObjectVersions, GetBucketLocation,
-GetBucketVersioning, GetBucketAcl.
+GetBucketVersioning, PutBucketVersioning, GetBucketAcl.
 
 Multipart: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
 AbortMultipartUpload, ListParts, ListMultipartUploads.
@@ -74,10 +75,13 @@ These are deliberate, and are the things most likely to surprise you:
   write is rejected with `InvalidArgument` rather than silently discarded.
 - **Multipart parts have no minimum size.** S3 requires every part except the
   last to be at least 5 MB. That is not enforced, so tests can use tiny parts.
-- **No versioning, lifecycle, ACL enforcement, or encryption.** The ACL and
-  versioning endpoints return static stub documents so SDK calls succeed.
-  ListObjectVersions reports every key once, as the latest version with the
-  `null` version id S3 uses for unversioned buckets.
+- **No lifecycle, ACL enforcement, or encryption.** The ACL endpoints return
+  static stub documents so SDK calls succeed.
+- **Versioning is supported but simplified.** Enabled and Suspended both work,
+  along with delete markers and `?versionId`. Two shortcuts:
+  ListObjectVersions paginates by key rather than key+version, so a key's
+  versions are never split across pages (no `version-id-marker`), and Version
+  and DeleteMarker entries are grouped rather than interleaved in key order.
 - **`NextMarker`/`NextContinuationToken` are real keys**, not opaque cursors.
   They resume correctly but do not match S3's values byte for byte.
 - **Signature verification accepts two query canonicalisations.** `a+b` in a
