@@ -58,6 +58,7 @@ info "Checking server health..."
 if curl -sf "$ENDPOINT/__health" >/dev/null; then
     pass "Server is healthy"
 else
+    echo "Start one with 'mise run server', or let 'mise run test-aws-cli' start it for you." >&2
     fail "Server not responding at $ENDPOINT"
 fi
 

@@ -55,8 +55,43 @@ run = [
 ]
 
 [tasks.test-aws-cli]
-description = "Run the AWS CLI contract script against a running server"
-run = "./test_aws_cli.sh"
+description = "Run the AWS CLI contract script (starts a server if none is running)"
+depends = ["deps"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+endpoint="http://127.0.0.1:${FAKES3_PORT:-4569}"
+
+# Reuse a server the user already has up; otherwise run a throwaway one against
+# a temp data dir so the suite never scribbles on real FAKES3_DATA_DIR state.
+if curl -sf "$endpoint/__health" >/dev/null 2>&1; then
+  exec ./test_aws_cli.sh "$endpoint"
+fi
+
+data_dir="$(mktemp -d)"
+server_log="$data_dir/server.log"
+
+# Server logs go to a file, not the terminal: interleaved request lines bury the
+# suite's own PASS/FAIL output. Dumped below only if startup fails.
+FAKES3_DATA_DIR="$data_dir" mix run --no-halt >"$server_log" 2>&1 &
+server_pid=$!
+trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -rf "$data_dir"' EXIT
+
+for _ in $(seq 50); do
+  curl -sf "$endpoint/__health" >/dev/null 2>&1 && break
+  kill -0 "$server_pid" 2>/dev/null || { echo "server exited during startup:" >&2; cat "$server_log" >&2; exit 1; }
+  sleep 0.2
+done
+
+if ! curl -sf "$endpoint/__health" >/dev/null 2>&1; then
+  echo "server did not become healthy at $endpoint within 10s:" >&2
+  cat "$server_log" >&2
+  exit 1
+fi
+
+./test_aws_cli.sh "$endpoint"
+"""
 
 [tasks.check]
 description = "Everything CI should run"
