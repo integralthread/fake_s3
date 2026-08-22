@@ -69,10 +69,10 @@ defmodule FakeS3.Router do
   post "/:bucket" do
     with :ok <- validate_bucket(bucket),
          true <- Storage.bucket_exists?(bucket) do
-      if Map.has_key?(conn.query_params, "delete") do
-        handle_delete_objects(conn, bucket)
-      else
-        s3_error(conn, :not_implemented, "/#{bucket}")
+      cond do
+        Map.has_key?(conn.query_params, "delete") -> handle_delete_objects(conn, bucket)
+        multipart_form?(conn) -> handle_post_object(conn, bucket)
+        true -> s3_error(conn, :not_implemented, "/#{bucket}")
       end
     else
       false -> s3_error(conn, :no_such_bucket, "/#{bucket}")
@@ -291,13 +291,19 @@ defmodule FakeS3.Router do
     end
   end
 
-  @known_list_params ~w(prefix delimiter max-keys marker encoding-type continuation-token
-                        start-after list-type fetch-owner)
+  # The bucket-level subresources S3 defines for GET that FakeS3 does not
+  # implement. Listed explicitly rather than treating every unrecognised query
+  # parameter as a subresource: a success_action_redirect sends the browser
+  # back to the bucket URL with ?bucket=&key=&etag= appended, and S3 answers
+  # that with a plain listing rather than 501.
+  @bucket_get_subresources ~w(accelerate analytics cors encryption
+                              intelligent-tiering inventory lifecycle logging
+                              metrics notification object-lock ownershipControls
+                              policy policyStatus publicAccessBlock replication
+                              requestPayment tagging website)
 
   defp subresource?(params) do
-    params
-    |> Map.keys()
-    |> Enum.any?(&(&1 not in @known_list_params))
+    Enum.any?(@bucket_get_subresources, &Map.has_key?(params, &1))
   end
 
   ## Object handlers
@@ -594,6 +600,179 @@ defmodule FakeS3.Router do
 
   defp delete_one(bucket, key, version_id) do
     Storage.delete_version(bucket, key, version_id)
+  end
+
+  ## POST object (browser form upload)
+
+  @max_post_body 5 * 1024 * 1024 * 1024
+
+  defp multipart_form?(conn) do
+    case get_req_header(conn, "content-type") do
+      [value | _] -> String.starts_with?(String.downcase(value), "multipart/form-data")
+      _ -> false
+    end
+  end
+
+  # Parsed here rather than in the plug pipeline: every other route streams its
+  # body straight to disk, and installing a body parser globally would buffer
+  # object uploads that are deliberately never held in memory.
+  defp handle_post_object(conn, bucket) do
+    parser = Plug.Parsers.init(parsers: [:multipart], length: @max_post_body, pass: ["*/*"])
+    conn = Plug.Parsers.call(conn, parser)
+
+    {upload, fields} = split_upload(conn.params)
+
+    with {:ok, key} <- post_key(fields, upload),
+         # Conditions are checked against the resolved key: "${filename}" is
+         # substituted first, so ["starts-with", "$key", ...] sees the name the
+         # object will actually get.
+         :ok <- check_post_policy(Map.put(fields, "key", key), bucket, upload),
+         {:ok, etag} <- store_post_object(bucket, key, upload, fields) do
+      post_success(conn, bucket, key, etag, fields)
+    else
+      {:error, reason} -> s3_error(conn, reason, "/#{bucket}")
+    end
+  rescue
+    # Plug raises on a body that is not parseable as multipart.
+    Plug.Parsers.ParseError -> s3_error(conn, :malformed_post_request, "/#{bucket}")
+  end
+
+  # Clients that build the form with a filename on every part — which is what
+  # requests' files= and many browser helpers do — make Plug parse ordinary
+  # fields as uploads too. Only "file" is the object body; every other part is
+  # read back as its text value.
+  defp split_upload(params) do
+    Enum.reduce(params, {nil, %{}}, fn {name, value}, {body, fields} ->
+      case String.downcase(name) do
+        "file" -> {post_body(value), fields}
+        field -> {body, Map.put(fields, field, field_value(value))}
+      end
+    end)
+  end
+
+  defp post_body(%Plug.Upload{path: path, filename: filename}),
+    do: %{path: path, data: nil, filename: filename || ""}
+
+  defp post_body(value) when is_binary(value), do: %{path: nil, data: value, filename: ""}
+  defp post_body(_), do: nil
+
+  defp field_value(%Plug.Upload{path: path}) do
+    case File.read(path) do
+      {:ok, contents} -> contents
+      _ -> ""
+    end
+  end
+
+  defp field_value(value) when is_binary(value), do: value
+  defp field_value(value), do: to_string(value)
+
+  # "${filename}" is replaced with the name the browser sent, which is the only
+  # way a plain form can name the object after the file the user picked.
+  defp post_key(fields, upload) do
+    case Map.get(fields, "key") do
+      nil ->
+        {:error, :missing_post_key}
+
+      "" ->
+        {:error, :missing_post_key}
+
+      key ->
+        filename = (upload && upload.filename) || ""
+        {:ok, String.replace(key, "${filename}", filename)}
+    end
+  end
+
+  defp upload_size(nil), do: 0
+  defp upload_size(%{data: data}) when is_binary(data), do: byte_size(data)
+
+  defp upload_size(%{path: path}) do
+    case File.stat(path) do
+      {:ok, %File.Stat{size: size}} -> size
+      _ -> 0
+    end
+  end
+
+  defp check_post_policy(fields, bucket, upload) do
+    case Map.get(fields, "policy") do
+      # No policy at all is an anonymous form post; there is nothing to enforce.
+      nil ->
+        :ok
+
+      encoded ->
+        with {:ok, policy} <- FakeS3.PostPolicy.decode(encoded) do
+          FakeS3.PostPolicy.validate(policy, fields, bucket, upload_size(upload))
+        end
+    end
+  end
+
+  defp store_post_object(bucket, key, upload, fields) do
+    content_type = Map.get(fields, "content-type") || "binary/octet-stream"
+    user_meta = post_user_metadata(fields)
+    version_id = new_version_id(bucket)
+
+    if version_id, do: Storage.archive_current(bucket, key)
+
+    writer = fn io ->
+      case upload do
+        nil -> Body.write_binary_to("", io)
+        %{data: data} when is_binary(data) -> Body.write_binary_to(data, io)
+        %{path: path} -> Body.stream_file_to(path, io)
+      end
+    end
+
+    with {:ok, meta_path, %{size: size, etag: etag}} <- Storage.put_object(bucket, key, writer),
+         meta =
+           bucket
+           |> Metadata.build_object_meta(key, size, etag, content_type, %{}, user_meta)
+           |> put_version_fields(version_id),
+         :ok <- Storage.write_json_atomic(meta_path, meta) do
+      {:ok, etag}
+    end
+  end
+
+  defp post_user_metadata(fields) do
+    fields
+    |> Enum.filter(fn {name, value} ->
+      String.starts_with?(name, "x-amz-meta-") and is_binary(value)
+    end)
+    |> Map.new()
+  end
+
+  # success_action_redirect wins over success_action_status; an unrecognised
+  # status falls back to 204 rather than being echoed back verbatim.
+  defp post_success(conn, bucket, key, etag, fields) do
+    location = "#{request_url_base(conn)}/#{bucket}/#{key}"
+
+    case redirect_target(fields) do
+      nil ->
+        case Map.get(fields, "success_action_status") do
+          "200" ->
+            send_resp(conn, 200, "")
+
+          "201" ->
+            xml = S3XML.post_response(location, bucket, key, etag)
+            xml_resp(conn, 201, xml)
+
+          _ ->
+            send_resp(conn, 204, "")
+        end
+
+      target ->
+        # Ordered list, not a map: S3 appends bucket, key, etag in that order
+        # and encode_query/1 would otherwise sort them alphabetically.
+        query = URI.encode_query([{"bucket", bucket}, {"key", key}, {"etag", etag}])
+
+        conn
+        |> put_resp_header("location", "#{target}?#{query}")
+        |> send_resp(303, "")
+    end
+  end
+
+  defp redirect_target(fields) do
+    case Map.get(fields, "success_action_redirect") || Map.get(fields, "redirect") do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
   end
 
   ## Multipart
@@ -1127,6 +1306,25 @@ defmodule FakeS3.Router do
 
   defp error_info(:not_implemented),
     do: {501, "NotImplemented", "This operation is not implemented by FakeS3."}
+
+  defp error_info(:missing_post_key),
+    do: {400, "InvalidArgument", "Bucket POST must contain a field named 'key'."}
+
+  defp error_info(:malformed_post_request),
+    do: {400, "MalformedPOSTRequest", "The body of your POST request is not well-formed."}
+
+  defp error_info(:invalid_policy_document),
+    do:
+      {400, "InvalidPolicyDocument",
+       "The content of the form does not meet the conditions specified in the policy document."}
+
+  # A POST that breaks the policy's content-length-range is a 400, unlike the
+  # 413 a PUT gets for exceeding FAKES3_MAX_BODY_BYTES.
+  defp error_info(:post_entity_too_large),
+    do: {400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size."}
+
+  defp error_info(:access_denied),
+    do: {403, "AccessDenied", "Access Denied."}
 
   defp error_info(:no_such_version),
     do: {404, "NoSuchVersion", "The specified version does not exist."}

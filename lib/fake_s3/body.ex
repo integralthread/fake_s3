@@ -25,6 +25,56 @@ defmodule FakeS3.Body do
   end
 
   @doc """
+  Copies an already-buffered upload into place, hashing as it goes.
+
+  A form upload arrives as a temp file on disk rather than as a body still on
+  the socket, so it cannot reuse `stream_to_file/2`, but it has to produce the
+  same `{size, etag}` payload.
+  """
+  def stream_file_to(path, io) do
+    case File.open(path, [:read, :binary]) do
+      {:ok, src} ->
+        try do
+          copy_hashing(src, io, :crypto.hash_init(:md5), 0)
+        after
+          File.close(src)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc "Writes an in-memory form field body, producing the same payload shape."
+  def write_binary_to(data, io) do
+    case IO.binwrite(io, data) do
+      :ok ->
+        hex = :md5 |> :crypto.hash(data) |> Base.encode16(case: :lower)
+        {:ok, %{size: byte_size(data), etag: "\"" <> hex <> "\""}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp copy_hashing(src, io, ctx, size) do
+    case IO.binread(src, 1_048_576) do
+      :eof ->
+        hex = ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        {:ok, %{size: size, etag: "\"" <> hex <> "\""}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      data ->
+        case IO.binwrite(io, data) do
+          :ok -> copy_hashing(src, io, :crypto.hash_update(ctx, data), size + byte_size(data))
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  @doc """
   True when the client framed the body itself rather than sending it raw.
   """
   def chunked?(conn) do

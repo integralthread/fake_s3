@@ -110,6 +110,18 @@ defmodule FakeS3.S3XML do
     |> generate()
   end
 
+  # No xmlns: S3 sends PostResponse un-namespaced, and browser code commonly
+  # does a plain find("Key") that a default namespace would break.
+  def post_response(location, bucket, key, etag) do
+    document(:PostResponse, %{}, [
+      element(:Location, location),
+      element(:Bucket, bucket),
+      element(:Key, key),
+      element(:ETag, etag)
+    ])
+    |> generate()
+  end
+
   def error(code, message, resource, request_id) do
     document(:Error, [
       element(:Code, code),

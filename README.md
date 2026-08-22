@@ -59,6 +59,13 @@ GetBucketVersioning, PutBucketVersioning, GetBucketAcl.
 Multipart: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
 AbortMultipartUpload, ListParts, ListMultipartUploads.
 
+Browser form uploads: `POST /<bucket>` with `multipart/form-data`, including
+`${filename}`, `success_action_status`, `success_action_redirect`, and the
+base64 policy document (expiration, `eq`, `starts-with`,
+`content-length-range`). The policy is enforced in every auth mode, since it is
+supplied by the client and describes what its own form may contain; the
+signature *over* the policy is only checked in `static`/`strict`.
+
 Request bodies framed with `Content-Encoding: aws-chunked` (what SDKs send
 when checksums or streaming signatures are enabled) are decoded before
 storage, so object bytes and ETags match the payload rather than the framing.

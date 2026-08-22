@@ -39,7 +39,7 @@ change any test outcome.
 
 ## Verified
 
-- `mix test` — 133 tests, 0 failures (on the updated deps).
+- `mix test` — 156 tests, 0 failures (on the updated deps).
 - `mise run check` — lint + compile + test, all green.
 - `./test_aws_cli.sh` — passes against a live server, exit 0.
 - `mise bootstrap` — works from a clean tree (`rm -rf vendor` then bootstrap).
@@ -49,7 +49,8 @@ change any test outcome.
   |---|---|---|---|---|
   | before whitespace fix | 122 | 143 | 1 | **573** |
   | after whitespace fix | 199 | 545 | 94 | **0** |
-  | after versioning | **217** | 527 | 94 | **0** |
+  | after versioning | 217 | 527 | 94 | **0** |
+  | after POST object | **249** | 495 | 94 | **0** |
 
 Note: the ExUnit suite boots a listener on `FAKES3_PORT`, so `mix test` fails
 with `:eaddrinuse` while `mise run server` is up on the same port. Use
@@ -68,27 +69,100 @@ tests in `test/bulk_delete_test.exs`. Errors are now 0 and every test runs.
 
 ## Recommended next action
 
-Versioning is done (below). The remaining failures are no longer one dominant
-cause — they are separate features, largest first:
+POST object is done (below). What remains, largest first:
 
 | area | failures | note |
 |---|---|---|
-| SSE / encryption (`test_copy_enc`, `test_copy_part_enc`) | ~68 | needs SSE-C/SSE-KMS headers; largest single block |
+| SSE / encryption (`test_copy_enc`, `test_copy_part_enc`) | ~68 | largest single block; SSE-C/SSE-KMS headers |
 | object lock | 29 | retention and legal hold |
-| POST object (browser form uploads) | 24 | a whole upload path FakeS3 lacks |
-| bucket logging | 14 | Ceph extension, low value here |
+| bucket logging | 14 | Ceph extension, little value outside Ceph |
 | bucket/object ACL enforcement | ~12 | currently a static stub |
-| versioning leftovers | 34 | see below — mostly ACL/lock/copy interactions |
+| POST leftovers | 8 | 4 need signature checking, rest are tags/SSE/checksum |
 
-Recommend **SSE** next purely on volume, but note none of these is a cascade:
-each is worth roughly its own count, so the choice is about which capability
-FakeS3 actually wants rather than which unblocks the most. Given it is a
-dev/test fake, POST object uploads are probably more useful in practice than
-encryption stubs, and object lock least of all.
+**Two paths, and they are different in kind.**
 
-The 34 remaining versioning failures are mostly interactions with features
-that do not exist yet (versioned ACLs, object lock on versions, versioned
-multipart copy), not gaps in the core versioning implemented here.
+*If the goal is the suite number*: SSE, on volume alone. But encryption in a
+local fake is largely theatre — storing plaintext and echoing back
+`x-amz-server-side-encryption` would pass many of these while implementing
+nothing real. That is a legitimate choice for a test double, but it should be a
+deliberate one rather than a side effect of chasing the count.
+
+*If the goal is a useful dev/test fake*: **ACL enforcement** is the better
+target despite the smaller count. It is currently a static stub that claims
+`FULL_CONTROL` for everyone, which means a caller cannot use FakeS3 to test
+that their own permission handling works — the fake always says yes. That is
+the kind of gap that silently invalidates someone's tests, unlike missing
+encryption, which fails loudly.
+
+Object lock and bucket logging both look like poor value here.
+
+### The 4 remaining POST auth failures
+
+`test_post_object_invalid_signature`, `_invalid_access_key`,
+`_missing_signature` and `_authenticated_request_bad_access_key` all expect
+403. They need HMAC verification of the policy signature, which needs the
+secret key, so they can only pass in `static`/`strict` mode — and the suite
+runs against the default `noauth`. Implementing it would not move these
+numbers; it would only matter to someone running the suite in strict mode.
+Deliberately left alone.
+
+## POST object — implemented
+
+Browser form uploads: `POST /<bucket>` with `multipart/form-data`, dispatched
+on content type so a `?delete` bulk delete and a plain POST still behave as
+before.
+
+The body is parsed with `Plug.Parsers` *inside the handler* rather than in the
+plug pipeline. Every other route streams its body straight to disk, and
+installing a parser globally would buffer object uploads that are deliberately
+never held in memory.
+
+Covered: the upload itself; `${filename}` substitution; `Content-Type` and
+`x-amz-meta-*`; `success_action_status` (200/201/204, anything else falling
+back to 204); `success_action_redirect` returning 303; and the base64 policy
+document — expiration, `eq`, `starts-with`, `content-length-range`, bidirectional
+field/condition matching, `x-ignore-*` exemption, and case-insensitive
+operators and field names. 23 tests in `test/post_object_test.exs`.
+
+The policy is treated as **request validation, not authentication**: it is
+supplied by the client and states what the form may contain, so it is enforced
+in every auth mode. Verifying the signature *over* the policy needs the secret
+key, so that stays with the configured mode — see above.
+
+Four things that were each a real bug, worth recording because none was obvious
+from the spec:
+
+- **Every form field arrives as a `Plug.Upload`.** Clients that put a filename
+  on every part — `requests`' `files=`, and many browser helpers — make Plug
+  parse ordinary fields as uploads. Only `file` is the body; the rest are read
+  back as text. Before this, the very first POST test 500'd.
+- **`${filename}` must be resolved before conditions are checked**, or
+  `["starts-with", "$key", "foo"]` sees the literal `${filename}`.
+- **`PostResponse` carries no xmlns.** With a default namespace, a browser's
+  plain `find("Key")` returns nothing.
+- **Elixir's `DateTime.from_iso8601` accepts any separator**, so Python's
+  `str(datetime)` ("2026-08-21 12:00:00+00:00") parsed as a valid expiration.
+  Now matched against a strict ISO 8601 pattern first.
+
+### Bucket GET subresource dispatch, corrected
+
+`success_action_redirect` sends the browser back to the bucket URL with
+`?bucket=&key=&etag=` appended. The old dispatch treated *any* unrecognised
+query parameter as an unimplemented subresource and answered 501; S3 answers
+with a plain listing. Replaced the heuristic with an explicit list of the
+bucket GET subresources S3 defines, mirroring what the PUT side already does.
+`?lifecycle` and friends still 501.
+
+### What it bought
+
+| | passed | failed | skipped | errors |
+|---|---|---|---|---|
+| before POST object | 217 | 545 | 94 | 0 |
+| after | **249** | 495 | 94 | 0 |
+
++32, zero regressions (`PASSED` sets diffed either side). All 32 are POST
+tests — the subresource-dispatch correction gained nothing on its own, it just
+unblocked the redirect test.
 
 ## Versioning — implemented
 
