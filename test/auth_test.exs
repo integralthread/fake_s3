@@ -1,8 +1,6 @@
 defmodule FakeS3.AuthTest do
   use ExUnit.Case, async: true
 
-  import FakeS3.TestServer
-
   describe "static auth mode" do
     setup do
       FakeS3.TestServer.setup_server(%{

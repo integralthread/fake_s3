@@ -140,3 +140,41 @@ fi
 
 exec .venv/bin/pytest "$@"
 """
+
+[tasks."bedrock:server"]
+description = "Run strict-auth S3 for local Bedrock development"
+dir = "{{config_root}}"
+depends = ["deps"]
+run = "mix run --no-halt"
+
+[tasks."bedrock:server".env]
+FAKES3_HOST = "127.0.0.1"
+FAKES3_PORT = "4569"
+FAKES3_DATA_DIR = "{{config_root}}/.fakes3-bedrock"
+FAKES3_MODE = "strict"
+FAKES3_ACCESS_KEY = "bedrock-local"
+FAKES3_SECRET_KEY = "bedrock-local-secret"
+FAKES3_REGION = "us-east-1"
+
+[tasks."bedrock:bucket"]
+description = "Create the local Bedrock bucket if missing (server must be running)"
+dir = "{{config_root}}"
+run = '''
+set -eu
+aws --endpoint-url http://127.0.0.1:4569 s3api head-bucket --bucket bedrock >/dev/null 2>&1 ||
+  aws --endpoint-url http://127.0.0.1:4569 s3api create-bucket --bucket bedrock
+'''
+
+[tasks."bedrock:bucket".env]
+AWS_ACCESS_KEY_ID = "bedrock-local"
+AWS_SECRET_ACCESS_KEY = "bedrock-local-secret"
+AWS_DEFAULT_REGION = "us-east-1"
+AWS_EC2_METADATA_DISABLED = "true"
+
+[tasks."test:bedrock"]
+description = "Run the real Bedrock S3 adapter and publication recovery tests"
+depends = ["deps"]
+run = "mix test test/bedrock_contract_test.exs test/publication_test.exs"
+
+[tasks."test:bedrock".env]
+FAKES3_PORT = "0"

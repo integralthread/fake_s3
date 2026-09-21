@@ -203,3 +203,80 @@ DATA_DIR/buckets/<bucket>/bucket.json          bucket metadata
 
 `tmp/` and `uploads/` are siblings of `objects/` so that partial writes are
 never visible to listings and never block bucket deletion.
+
+## Bedrock local development
+
+The Bedrock 0.7.2 S3 adapter is exercised directly by our test suite, through
+ExAws/Req with strict SigV4 authentication. It is a **test-only dependency**;
+FakeS3 does not start a Bedrock cluster.
+
+From this repository:
+
+```sh
+mise run bedrock:server
+# In another terminal, create the bucket (safe to repeat):
+mise run bedrock:bucket
+```
+
+Or manage the server with `mise exec -- pitchfork start fake_s3` and
+`mise exec -- pitchfork stop fake_s3`. The dedicated development profile uses
+loopback port 4569 and persistent `.fakes3-bedrock/` storage. Its credentials are
+fixed local-development values, not AWS credentials. Strict mode also requires signed
+health requests; use the bucket task as an authenticated readiness check.
+
+In the consuming application:
+
+```elixir
+config :bedrock, Bedrock.ObjectStorage,
+  backend: :s3,
+  s3: [
+    bucket: "bedrock",
+    access_key_id: "bedrock-local",
+    secret_access_key: "bedrock-local-secret",
+    region: "us-east-1",
+    scheme: "http://",
+    host: "127.0.0.1",
+    port: 4569
+  ]
+```
+
+Use an **unversioned bucket** for this profile. AshBedrock still needs its own
+Bedrock cluster/repo configuration; FakeS3 supplies only the object-storage service.
+
+### Concurrency and recovery contract
+
+- PUT honors `If-None-Match: *` and strong `If-Match` ETags. Rejected writes return
+  S3 XML `PreconditionFailed` (412) without changing the object. ETags are the CAS
+  tokens; S3 VersionId is not needed by Bedrock.
+- Requests sharing a data directory are serialized within one BEAM VM. This
+  includes ordinary writes, COPY, multipart completion, deletes, and reads, so
+  other operations cannot race a conditional write. **Run only one server VM per
+  data directory**; this is not a cross-process filesystem lock.
+- GET/HEAD/Range capture the object bytes under that lock, preserving their ETag
+  and length. This buffers the object in memory and deliberately prioritizes
+  local-development correctness over high-throughput or huge-object workloads.
+- An undo journal under `.publications/` protects body/metadata publication for
+  PUT, COPY, multipart completion, and unversioned DELETE. Interrupted publication
+  is recovered before the next request, including after a process restart. Data
+  and metadata staging files are synced before publication. Metadata staging is
+  outside object listings and cleared during recovery.
+- Corrupt metadata and storage I/O failures return server errors rather than
+  pretending that an object or prefix is absent. Delete reports failed removals.
+- Tests cover process interruption and listener restart. This is **not a claim
+  of host-power-loss durability or production S3 equivalence**: directory fsync,
+  multi-VM coordination, and complete versioning/multipart crash semantics remain
+  outside the local Bedrock profile. Do not edit storage files while serving.
+
+### Compatibility tests
+
+```sh
+mise run test:bedrock
+FAKES3_PORT=0 mise run check
+```
+
+The dedicated suite uses isolated temporary stores and covers the actual Bedrock
+adapter's CRUD, conditional-create races, CAS races, binary values and ETags,
+1,003-key pagination, prefix/limit handling, a deleted continuation key, storage
+errors (including a failed second listing page), interrupted publication recovery,
+and persistent listener restart. The full suite also retains the existing S3
+client, multipart, versioning, range, and authentication tests.

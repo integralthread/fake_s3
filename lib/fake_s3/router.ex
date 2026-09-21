@@ -20,7 +20,36 @@ defmodule FakeS3.Router do
 
   def call(conn, opts) do
     conn = FakeS3.ConfigPlug.call(conn, FakeS3.ConfigPlug.init(opts))
-    super(conn, opts)
+    # One VM owns a data directory. Hold the lock through response creation
+    # so readers cannot pair metadata with a concurrently replaced body. This
+    # also includes COPY, multipart completion, deletes and bucket changes.
+    :global.trans(
+      {{__MODULE__, Path.expand(Config.data_dir())}, self()},
+      fn ->
+        try do
+          FakeS3.Publication.recover!()
+          super(conn, opts)
+        rescue
+          error in Plug.Conn.WrapperError ->
+            case error.reason do
+              reason
+              when is_struct(reason, File.Error) or is_struct(reason, FakeS3.StorageError) ->
+                s3_error(
+                  error.conn,
+                  {:storage_error, Exception.message(reason)},
+                  conn.request_path
+                )
+
+              _ ->
+                reraise error, __STACKTRACE__
+            end
+
+          error in [File.Error, FakeS3.StorageError] ->
+            s3_error(conn, {:storage_error, Exception.message(error)}, conn.request_path)
+        end
+      end,
+      [node()]
+    )
   end
 
   get "/__health" do
@@ -309,34 +338,75 @@ defmodule FakeS3.Router do
   ## Object handlers
 
   defp handle_put_object(conn, bucket, key) do
+    with :ok <- Storage.check_key_conflict(bucket, key),
+         :ok <- check_write_conditions(conn, bucket, key) do
+      do_put_object(conn, bucket, key)
+    else
+      {:error, reason} -> s3_error(conn, reason, conn.request_path)
+    end
+  end
+
+  defp check_write_conditions(conn, bucket, key) do
+    with {:ok, etag} <- current_etag(bucket, key) do
+      match = get_req_header(conn, "if-match")
+      none = get_req_header(conn, "if-none-match")
+
+      cond do
+        match != [] and not etag_matches?(match, etag) -> {:error, :precondition_failed}
+        none != [] and etag_matches?(none, etag) -> {:error, :precondition_failed}
+        true -> :ok
+      end
+    end
+  end
+
+  defp current_etag(bucket, key) do
+    case Storage.read_object(bucket, key) do
+      {:ok, %{meta: meta}} -> {:ok, meta["etag"]}
+      {:error, :not_found} -> {:ok, nil}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp etag_matches?(_headers, nil), do: false
+
+  defp etag_matches?(headers, etag) do
+    headers
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&String.trim/1)
+    |> Enum.any?(&(&1 == "*" or &1 == etag))
+  end
+
+  defp do_put_object(conn, bucket, key) do
     content_type = content_type(conn, key)
     {headers, user_meta} = Metadata.extract_headers(conn.req_headers)
     version_id = new_version_id(bucket)
 
-    # The prior version has to move aside before the new content lands on top
-    # of it, since the current version keeps the unversioned path.
-    if version_id, do: Storage.archive_current(bucket, key)
+    result =
+      Storage.publish_object(bucket, key, fn ->
+        # Conditions were checked under the same request lock, before any
+        # version or body mutation. Bedrock uses unversioned buckets.
+        if version_id, do: Storage.archive_current(bucket, key)
 
-    case Storage.put_object(bucket, key, &Body.stream_to_file(conn, &1)) do
-      {:ok, meta_path, %{size: size, etag: etag}} ->
-        meta =
-          bucket
-          |> Metadata.build_object_meta(key, size, etag, content_type, headers, user_meta)
-          |> put_version_fields(version_id)
-
-        case Storage.write_json_atomic(meta_path, meta) do
-          :ok ->
-            conn
-            |> put_resp_header("etag", etag)
-            |> maybe_version_header(version_id)
-            |> send_resp(200, "")
-
-          {:error, reason} ->
-            s3_error(conn, reason, "/#{bucket}/#{key}")
+        with {:ok, meta_path, %{size: size, etag: etag}} <-
+               Storage.put_object(bucket, key, &Body.stream_to_file(conn, &1)),
+             meta =
+               bucket
+               |> Metadata.build_object_meta(key, size, etag, content_type, headers, user_meta)
+               |> put_version_fields(version_id),
+             :ok <- Storage.write_json_atomic(meta_path, meta) do
+          {:ok, etag}
         end
+      end)
+
+    case result do
+      {:ok, etag} ->
+        conn
+        |> put_resp_header("etag", etag)
+        |> maybe_version_header(version_id)
+        |> send_resp(200, "")
 
       {:error, reason} ->
-        s3_error(conn, reason, "/#{bucket}/#{key}")
+        s3_error(conn, reason, conn.request_path)
     end
   end
 
@@ -382,13 +452,12 @@ defmodule FakeS3.Router do
   defp handle_head_object(conn, bucket, key) do
     case resolve_version(conn, bucket, key) do
       {:ok, %{content_path: path, meta: meta, stat: stat}} ->
-        # send_resp/3 would let the adapter derive Content-Length from the
-        # (empty) body and report 0. Going through send_file makes cowboy
-        # derive it from the file while still omitting the body for HEAD.
+        # Supply the actual entity length; Cowboy omits the body for HEAD.
+        # The response bytes and metadata are captured under the same lock.
         conn
         |> apply_object_headers(meta)
         |> apply_version_headers(meta)
-        |> send_file(200, path, 0, stat.size)
+        |> send_stored_file(200, path, 0, stat.size)
 
       {:delete_marker, meta} ->
         delete_marker_response(conn, bucket, key, meta)
@@ -429,8 +498,10 @@ defmodule FakeS3.Router do
         end
 
       {nil, _} ->
-        Storage.delete_object(bucket, key)
-        send_resp(conn, 204, "")
+        case Storage.delete_object(bucket, key) do
+          :ok -> send_resp(conn, 204, "")
+          {:error, reason} -> s3_error(conn, reason, conn.request_path)
+        end
     end
   end
 
@@ -448,6 +519,9 @@ defmodule FakeS3.Router do
               %{"delete_marker" => true} = meta -> {:delete_marker, meta}
               _ -> {:error, :no_such_key}
             end
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       version_id ->
@@ -569,8 +643,14 @@ defmodule FakeS3.Router do
 
             case Key.safe_key(key || "") do
               {:ok, safe_key} ->
-                delete_one(bucket, safe_key, version_id)
-                {[key | ok], failed}
+                case delete_one(bucket, safe_key, version_id) do
+                  result when result == :ok or elem(result, 0) == :ok ->
+                    {[key | ok], failed}
+
+                  {:error, reason} ->
+                    {_status, code, message} = error_info(reason)
+                    {ok, [{key, code, message} | failed]}
+                end
 
               {:error, _} ->
                 {ok, [{key, "InvalidArgument", "The specified key is not valid."} | failed]}
@@ -813,7 +893,9 @@ defmodule FakeS3.Router do
           end)
           |> Enum.reject(fn {number, _} -> is_nil(number) end)
 
-        case Multipart.complete(bucket, upload_id, parts) do
+        case Storage.publish_object(bucket, key, fn ->
+               Multipart.complete(bucket, upload_id, parts)
+             end) do
           {:ok, %{etag: etag}} ->
             location = "#{request_url_base(conn)}/#{bucket}/#{key}"
             xml = S3XML.complete_multipart_upload_result(location, bucket, key, etag)
@@ -1071,8 +1153,8 @@ defmodule FakeS3.Router do
 
             {[entry | contents], prefixes}
 
-          _ ->
-            {contents, prefixes}
+          {:error, reason} ->
+            raise FakeS3.StorageError, reason: {:listing_object, key, reason}
         end
 
       {:prefix, name, _}, {contents, prefixes} ->
@@ -1110,10 +1192,24 @@ defmodule FakeS3.Router do
     end)
   end
 
+  # Cowboy can defer opening sendfile paths until after this process returns.
+  # Capture the bytes under the storage lock, so an overwrite cannot change
+  # the body after its ETag/length were selected. This intentionally buffers
+  # local-development objects in memory.
+  defp send_stored_file(conn, status, path, offset, length) do
+    body = File.read!(path)
+    length = if length == :all, do: byte_size(body) - offset, else: length
+    body = binary_part(body, offset, length)
+
+    conn
+    |> put_resp_header("content-length", Integer.to_string(length))
+    |> send_resp(status, body)
+  end
+
   defp send_object(conn, path, size) do
     case get_req_header(conn, "range") do
       [value | _] -> send_range(conn, value, path, size)
-      _ -> send_file(conn, 200, path, 0, size)
+      _ -> send_stored_file(conn, 200, path, 0, size)
     end
   end
 
@@ -1122,7 +1218,7 @@ defmodule FakeS3.Router do
       {:ok, {start, length, end_pos}} ->
         conn
         |> put_resp_header("content-range", "bytes #{start}-#{end_pos}/#{size}")
-        |> send_file(206, path, start, length)
+        |> send_stored_file(206, path, start, length)
 
       :unsatisfiable ->
         conn
@@ -1131,7 +1227,7 @@ defmodule FakeS3.Router do
 
       # RFC 7233: an unparseable Range must be ignored, not rejected.
       :ignore ->
-        send_file(conn, 200, path, 0, size)
+        send_stored_file(conn, 200, path, 0, size)
     end
   end
 
@@ -1243,6 +1339,10 @@ defmodule FakeS3.Router do
     xml = S3XML.error(code, message, resource, request_id(conn))
     xml_resp(conn, status, xml)
   end
+
+  defp error_info(:precondition_failed),
+    do:
+      {412, "PreconditionFailed", "At least one of the preconditions you specified did not hold."}
 
   defp error_info(:no_such_bucket),
     do: {404, "NoSuchBucket", "The specified bucket does not exist."}

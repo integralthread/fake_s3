@@ -1,8 +1,6 @@
 defmodule FakeS3.MaxBodyTest do
   use ExUnit.Case, async: true
 
-  import FakeS3.TestServer
-
   describe "max body bytes enforcement" do
     setup do
       FakeS3.TestServer.setup_server(%{mode: "noauth", max_body_bytes: 100})

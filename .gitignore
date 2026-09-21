@@ -31,3 +31,6 @@ fake_s3-*.tar
 # Third-party test suites cloned by "mise run bootstrap".
 /vendor/
 
+
+# Persistent local Bedrock development objects.
+/.fakes3-bedrock/

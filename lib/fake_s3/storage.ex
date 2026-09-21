@@ -50,7 +50,11 @@ defmodule FakeS3.Storage do
   end
 
   def bucket_exists?(bucket) do
-    File.dir?(bucket_dir(bucket))
+    case File.stat(bucket_dir(bucket)) do
+      {:ok, %File.Stat{type: :directory}} -> true
+      {:error, :enoent} -> false
+      other -> raise FakeS3.StorageError, reason: {:bucket_unreadable, bucket, other}
+    end
   end
 
   def create_bucket(bucket, created_at) do
@@ -62,8 +66,10 @@ defmodule FakeS3.Storage do
 
   def delete_bucket(bucket) do
     if bucket_empty?(bucket) do
-      File.rm_rf(bucket_dir(bucket))
-      :ok
+      case File.rm_rf(bucket_dir(bucket)) do
+        {:ok, _} -> :ok
+        {:error, reason, _} -> {:error, reason}
+      end
     else
       {:error, :not_empty}
     end
@@ -77,50 +83,35 @@ defmodule FakeS3.Storage do
   would call a bucket empty while its version history was still on disk.
   """
   def bucket_empty?(bucket) do
-    Enum.all?([objects_dir(bucket), meta_dir(bucket), versions_meta_dir(bucket)], fn dir ->
-      case File.dir?(dir) do
-        false -> true
-        true -> not any_file?(dir)
+    optional_versions_dir = versions_meta_dir(bucket)
+
+    Enum.all?([objects_dir(bucket), meta_dir(bucket), optional_versions_dir], fn dir ->
+      case File.stat(dir) do
+        {:ok, %File.Stat{type: :directory}} -> walk_files(dir) == []
+        {:error, :enoent} when dir == optional_versions_dir -> true
+        other -> raise FakeS3.StorageError, reason: {:bucket_unreadable, dir, other}
       end
     end)
   end
 
   def list_buckets do
     buckets_root = Path.join([Config.data_dir(), "buckets"])
-    File.mkdir_p(buckets_root)
+    File.mkdir_p!(buckets_root)
 
-    case File.ls(buckets_root) do
-      {:ok, entries} ->
-        entries
-        |> Enum.filter(&File.dir?(Path.join(buckets_root, &1)))
-        |> Enum.map(&bucket_meta(&1))
-        |> Enum.reject(&is_nil/1)
-        |> Enum.sort_by(& &1.name)
-
-      {:error, _} ->
-        []
-    end
+    buckets_root
+    |> File.ls!()
+    |> Enum.filter(fn entry -> File.lstat!(Path.join(buckets_root, entry)).type == :directory end)
+    |> Enum.map(&bucket_meta/1)
+    |> Enum.sort_by(& &1.name)
   end
 
   def bucket_meta(bucket) do
-    path = bucket_meta_path(bucket)
+    case read_json(bucket_meta_path(bucket)) do
+      {:ok, %{"name" => name, "created_at" => created_at} = meta} ->
+        %{name: name, created_at: created_at, versioning: meta["versioning"]}
 
-    case File.read(path) do
-      {:ok, body} ->
-        case Jason.decode(body) do
-          {:ok, meta} ->
-            %{
-              name: meta["name"],
-              created_at: meta["created_at"],
-              versioning: meta["versioning"]
-            }
-
-          _ ->
-            nil
-        end
-
-      _ ->
-        nil
+      other ->
+        raise FakeS3.StorageError, reason: {:bucket_metadata_unreadable, bucket, other}
     end
   end
 
@@ -189,12 +180,29 @@ defmodule FakeS3.Storage do
   end
 
   @doc """
-  Streams an object into place via temp+rename.
+  Publish an object's body and metadata as one recoverable operation.
 
-  `fun` receives an open IO device and returns `{:ok, payload}` or
-  `{:error, reason}`; the payload is handed back to the caller so it can build
-  metadata from whatever the writer computed (size, etag).
+  The caller must hold the data-directory request lock. `fun` returns `:ok`,
+  `{:ok, result}`, or `{:error, reason}`. Failed and interrupted operations
+  restore the previous object before another request can observe it.
   """
+  def publish_object(bucket, key, fun) do
+    archive_paths =
+      case read_current_meta(bucket, key) do
+        %{"version_id" => version} when version != "null" ->
+          [version_path(bucket, key, version), version_meta_path(bucket, key, version)]
+
+        _ ->
+          []
+      end
+
+    FakeS3.Publication.run(
+      [object_path(bucket, key), object_meta_path(bucket, key)] ++ archive_paths,
+      fun
+    )
+  end
+
+  @doc "Stage and publish the body; call inside publish_object/3 with metadata publication."
   def put_object(bucket, key, fun) do
     content_path = object_path(bucket, key)
     meta_path = object_meta_path(bucket, key)
@@ -222,7 +230,9 @@ defmodule FakeS3.Storage do
       {:ok, io} ->
         result =
           try do
-            fun.(io)
+            with {:ok, payload} <- fun.(io), :ok <- :file.sync(io) do
+              {:ok, payload}
+            end
           after
             File.close(io)
           end
@@ -260,10 +270,13 @@ defmodule FakeS3.Storage do
 
   def write_json_atomic(path, data) do
     File.mkdir_p(Path.dirname(path))
-    temp_path = path <> ".tmp-" <> unique_suffix()
+    # Keep interrupted metadata staging outside all object/version listings.
+    staging = Path.join(Config.data_dir(), ".staging")
+    File.mkdir_p!(staging)
+    temp_path = Path.join(staging, unique_suffix())
     payload = Jason.encode!(data)
 
-    with :ok <- File.write(temp_path, payload),
+    with :ok <- File.write(temp_path, payload, [:sync]),
          :ok <- File.rename(temp_path, path) do
       :ok
     else
@@ -277,26 +290,45 @@ defmodule FakeS3.Storage do
     content_path = object_path(bucket, key)
     meta_path = object_meta_path(bucket, key)
 
-    with {:ok, %File.Stat{type: :regular} = stat} <- File.stat(content_path),
-         {:ok, meta} <- read_json(meta_path) do
-      {:ok, %{content_path: content_path, meta: meta, stat: stat}}
-    else
-      _ -> {:error, :not_found}
+    case {File.stat(content_path), read_json(meta_path)} do
+      {{:ok, %File.Stat{type: :regular} = stat}, {:ok, meta}} when is_map(meta) ->
+        if meta["size"] == stat.size and is_binary(meta["etag"]) do
+          {:ok, %{content_path: content_path, meta: meta, stat: stat}}
+        else
+          {:error, :corrupt_object}
+        end
+
+      {{:error, :enoent}, {:error, :enoent}} ->
+        {:error, :not_found}
+
+      {{:error, :enoent}, {:ok, %{"delete_marker" => true}}} ->
+        {:error, :not_found}
+
+      {{:ok, %File.Stat{type: :directory}}, {:error, :enoent}} ->
+        {:error, :not_found}
+
+      {body, meta} ->
+        {:error, {:object_unreadable, body, meta}}
     end
   end
 
   def delete_object(bucket, key) do
-    content_path = object_path(bucket, key)
-    meta_path = object_meta_path(bucket, key)
+    publish_object(bucket, key, fn ->
+      with :ok <- remove_if_present(object_path(bucket, key)),
+           :ok <- remove_if_present(object_meta_path(bucket, key)) do
+        prune_empty_dirs(Path.dirname(object_path(bucket, key)), objects_dir(bucket))
+        prune_empty_dirs(Path.dirname(object_meta_path(bucket, key)), meta_dir(bucket))
+        :ok
+      end
+    end)
+  end
 
-    File.rm(content_path)
-    File.rm(meta_path)
-
-    # Leaving the directory behind would block a later PUT of the parent key.
-    prune_empty_dirs(Path.dirname(content_path), objects_dir(bucket))
-    prune_empty_dirs(Path.dirname(meta_path), meta_dir(bucket))
-
-    :ok
+  defp remove_if_present(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      error -> error
+    end
   end
 
   defp prune_empty_dirs(dir, root) do
@@ -318,6 +350,14 @@ defmodule FakeS3.Storage do
   replace it (REPLACE).
   """
   def copy_object(src_bucket, src_key, dest_bucket, dest_key, replacement \\ nil) do
+    with :ok <- check_key_conflict(dest_bucket, dest_key) do
+      publish_object(dest_bucket, dest_key, fn ->
+        do_copy_object(src_bucket, src_key, dest_bucket, dest_key, replacement)
+      end)
+    end
+  end
+
+  defp do_copy_object(src_bucket, src_key, dest_bucket, dest_key, replacement) do
     same_object? = src_bucket == dest_bucket and src_key == dest_key
 
     case read_object(src_bucket, src_key) do
@@ -344,6 +384,9 @@ defmodule FakeS3.Storage do
 
       {:error, :not_found} ->
         {:error, :source_not_found}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -461,8 +504,9 @@ defmodule FakeS3.Storage do
 
   def read_current_meta(bucket, key) do
     case read_json(object_meta_path(bucket, key)) do
-      {:ok, meta} -> meta
-      _ -> nil
+      {:ok, meta} when is_map(meta) -> meta
+      {:error, :enoent} -> nil
+      other -> raise FakeS3.StorageError, reason: {:metadata_unreadable, bucket, key, other}
     end
   end
 
@@ -694,21 +738,12 @@ defmodule FakeS3.Storage do
   def list_keys(bucket) do
     dir = objects_dir(bucket)
 
-    case File.dir?(dir) do
-      false ->
-        []
-
-      true ->
-        dir
-        |> walk_files()
-        |> Enum.map(fn path ->
-          path
-          |> Path.relative_to(dir)
-          |> Path.split()
-          |> Enum.join("/")
-        end)
-        |> Enum.sort()
-    end
+    dir
+    |> walk_files()
+    |> Enum.map(fn path ->
+      path |> Path.relative_to(dir) |> Path.split() |> Enum.join("/")
+    end)
+    |> Enum.sort()
   end
 
   defp read_json(path) do
@@ -725,40 +760,17 @@ defmodule FakeS3.Storage do
   end
 
   defp walk_files(dir) do
-    case File.ls(dir) do
-      {:ok, entries} ->
-        entries
-        |> Enum.flat_map(fn entry ->
-          path = Path.join(dir, entry)
+    dir
+    |> File.ls!()
+    |> Enum.flat_map(fn entry ->
+      path = Path.join(dir, entry)
 
-          cond do
-            File.dir?(path) -> walk_files(path)
-            File.regular?(path) -> [path]
-            true -> []
-          end
-        end)
-
-      _ ->
-        []
-    end
-  end
-
-  defp any_file?(dir) do
-    case File.ls(dir) do
-      {:ok, entries} ->
-        Enum.any?(entries, fn entry ->
-          path = Path.join(dir, entry)
-
-          cond do
-            File.regular?(path) -> true
-            File.dir?(path) -> any_file?(path)
-            true -> false
-          end
-        end)
-
-      _ ->
-        false
-    end
+      case File.lstat!(path) do
+        %File.Stat{type: :directory} -> walk_files(path)
+        %File.Stat{type: :regular} -> [path]
+        _ -> raise FakeS3.StorageError, reason: {:unexpected_file_type, path}
+      end
+    end)
   end
 
   def debug_list_all_objects do

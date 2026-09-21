@@ -32,7 +32,11 @@ defmodule FakeS3.MixProject do
       {:mime, "~> 2.0"},
       {:xml_builder, "~> 2.2"},
       {:req, "~> 0.5", only: :test},
-      {:req_s3, "~> 0.2.3", only: :test}
+      {:req_s3, "~> 0.2.3", only: :test},
+      {:ex_aws, "~> 2.7", only: :test},
+      {:ex_aws_s3, "~> 2.5", only: :test},
+      {:sweet_xml, "~> 0.7", only: :test},
+      {:bedrock, "~> 0.7.2", only: :test, runtime: false}
     ]
   end
 end
