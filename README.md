@@ -219,12 +219,14 @@ mise run bedrock:bucket
 ```
 
 Or manage the server with `mise exec -- pitchfork start fake_s3` and
-`mise exec -- pitchfork stop fake_s3`. The dedicated development profile uses
-loopback port 4569 and persistent `.fakes3-bedrock/` storage. Its credentials are
+`mise exec -- pitchfork stop fake_s3`. The dedicated development profile listens on
+loopback at the port `portez bedrock` assigns to this directory (run it to see the
+number) and uses persistent `.fakes3-bedrock/` storage. Its credentials are
 fixed local-development values, not AWS credentials. Strict mode also requires signed
 health requests; use the bucket task as an authenticated readiness check.
 
-In the consuming application:
+In the consuming application, read the port from the environment (for example
+`PORT_S3 = "{{ exec(command='portez -q -C fake_s3 bedrock') }}"` in its `mise.toml`):
 
 ```elixir
 config :bedrock, Bedrock.ObjectStorage,
@@ -236,7 +238,7 @@ config :bedrock, Bedrock.ObjectStorage,
     region: "us-east-1",
     scheme: "http://",
     host: "127.0.0.1",
-    port: 4569
+    port: String.to_integer(System.fetch_env!("PORT_S3"))
   ]
 ```
 
